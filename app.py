@@ -28,7 +28,7 @@ KEY ENGINEERING DATA:
 - Aisle Float buoyancy: 74 kg
 - Hardware multipliers: modules x2 (clamps), x2.67 (bolts), x4.67 (washers)
 - Mooring formula P014: rope length = 3.23 x WD + 0.35
-- Mooring formula P013: rope length = sqrt(HD2 + WD2)
+- Mooring formula P013: rope length = sqrt(HD squared + WD squared)
 - Target mooring angle: 17.8-18.2 degrees (P014), 15-18 degrees (P013)
 - IFP platforms: Ferrocement barge design, GWM is external marine engineering consultant
 - Destructive test data: first crack at 8T, ultimate failure at 28T
@@ -38,11 +38,11 @@ MANUFACTURING:
 - Production achievement improved from ~73% (early 2025) to ~91% (late 2025)
 
 WHEN RECEIVING A DAILY PROGRESS REPORT (DPR):
-- Extract: date, modules installed today, total modules installed, MW completed, % complete
+- Extract: date, modules installed today, total modules installed, MW completed, percent complete
 - List array-by-array status (launching done / towing done)
 - Flag any in-progress arrays
 - Note damage count, manpower deployed
-- Summarize tomorrow's plan
+- Summarize tomorrow plan
 - Keep response concise and structured
 
 RESPONSE STYLE:
@@ -53,51 +53,54 @@ RESPONSE STYLE:
 - Always be professional and helpful to the site and engineering team
 """
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-        incoming_msg = request.form.get("Body", "").strip()
-        sender = request.form.get("From", "")
+    incoming_msg = request.form.get("Body", "").strip()
+    sender = request.form.get("From", "")
 
     if not incoming_msg:
-                return str(MessagingResponse())
+        return str(MessagingResponse())
 
     if sender not in conversations:
-                conversations[sender] = []
+        conversations[sender] = []
 
     conversations[sender].append({
-                "role": "user",
-                "content": incoming_msg
+        "role": "user",
+        "content": incoming_msg
     })
 
     if len(conversations[sender]) > 10:
-                conversations[sender] = conversations[sender][-10:]
+        conversations[sender] = conversations[sender][-10:]
 
     try:
-                response = claude.messages.create(
-                                model="claude-sonnet-4-20250514",
-                                max_tokens=1024,
-                                system=SYSTEM_PROMPT,
-                                messages=conversations[sender]
-                )
-                reply = response.content[0].text
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=conversations[sender]
+        )
+        reply = response.content[0].text
 
         conversations[sender].append({
-                        "role": "assistant",
-                        "content": reply
+            "role": "assistant",
+            "content": reply
         })
 
-except Exception as e:
-        reply = f"Sorry, I encountered an error. Please try again. ({str(e)[:50]})"
+    except Exception as e:
+        reply = "Sorry, I encountered an error. Please try again."
 
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
+
 @app.route("/", methods=["GET"])
 def health():
-        return "Floatex WhatsApp Bot is running", 200
+    return "Floatex WhatsApp Bot is running", 200
+
 
 if __name__ == "__main__":
-        port = int(os.environ.get("PORT", 5000))
-        app.run(host="0.0.0.0", port=port)
-    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
