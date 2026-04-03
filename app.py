@@ -677,9 +677,209 @@ def webhook():
     return str(MessagingResponse())
 
 
+# --- Document Knowledge Extraction ---
+
+DOC_EXTRACTION_PROMPT = """You are analyzing a document from Floatex Solar's project management portal. Extract structured knowledge.
+
+Return a JSON object:
+{
+  "summary": "2-3 sentence summary of what this document contains",
+  "category": "engineering|procurement|quality|safety|drawing|schedule|contractual",
+  "specs": [{"param": "parameter name", "value": "value", "unit": "unit"}],
+  "quantities": [{"item": "item name", "qty": "quantity", "unit": "unit"}],
+  "vendors": [{"name": "vendor", "item": "what they supply", "price": "if mentioned", "currency": "INR/USD"}],
+  "dates": [{"event": "what happens", "date": "YYYY-MM-DD or description", "status": "planned|completed|delayed"}],
+  "references": [{"doc_no": "referenced document number", "relationship": "how it relates"}],
+  "decisions": [{"decision": "what was decided", "conditions": "any conditions", "approved_by": "who"}],
+  "tags": ["relevant", "searchable", "tags"]
+}
+
+Rules:
+- Extract EVERY technical spec, dimension, rating, material grade, cable size, load value, safety factor you find
+- For ordering notes: capture vendor, item, quantity, price, delivery date
+- For drawings: capture key dimensions, coordinates, layout parameters
+- For analysis reports: capture methodology, key results, safety factors, failure modes
+- If a field has no data, use empty array []
+- Return ONLY valid JSON"""
+
+
+def process_document_file(file_id, document_id, filename, file_url):
+    """Fetch a document from Supabase storage, extract text, analyze with Claude."""
+    try:
+        print(f"[DOC] Processing: {filename} (file_id: {file_id})")
+
+        # Get document metadata
+        doc_result = supabase.table("documents").select("project_id, doc_no, doc_type, title, section, package").eq("id", document_id).single().execute()
+        doc = doc_result.data if doc_result.data else {}
+        project_id = doc.get("project_id")
+        doc_no = doc.get("doc_no", "")
+        doc_type = doc.get("doc_type", "")
+
+        # Create pending record
+        dk_result = supabase.table("doc_knowledge").insert({
+            "document_id": document_id,
+            "document_file_id": file_id,
+            "project_id": project_id,
+            "doc_no": doc_no,
+            "doc_type": doc_type,
+            "category": "engineering",
+            "processing_status": "processing",
+        }).execute()
+        dk_id = dk_result.data[0]["id"] if dk_result.data else None
+
+        # Fetch file from Supabase storage
+        file_response = supabase.storage.from_("portal-files").download(file_url)
+        file_bytes = file_response
+
+        is_pdf = filename.lower().endswith(".pdf")
+        is_image = any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"])
+
+        # Build content for Claude
+        content = []
+
+        if is_pdf:
+            # Send PDF as base64 document to Claude
+            b64_data = base64.standard_b64encode(file_bytes).decode("utf-8")
+            content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
+            })
+        elif is_image:
+            # Send as image
+            b64_data = base64.standard_b64encode(file_bytes).decode("utf-8")
+            ext = filename.rsplit(".", 1)[-1].lower()
+            media_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64_data},
+            })
+        else:
+            # Skip unsupported formats
+            if dk_id:
+                supabase.table("doc_knowledge").update({
+                    "processing_status": "skipped",
+                    "error_message": f"Unsupported file type: {filename}",
+                    "processed_at": json_now(),
+                }).eq("id", dk_id).execute()
+            print(f"[DOC] Skipped unsupported: {filename}")
+            return
+
+        context = f"Document: {doc_no}\nTitle: {doc.get('title', '')}\nType: {doc_type}\nSection: {doc.get('section', '')}\nPackage: {doc.get('package', '')}\nFilename: {filename}"
+
+        # Fetch existing knowledge for cross-referencing
+        existing = supabase.table("doc_knowledge").select("doc_no, summary, category, specs, tags").eq("project_id", project_id).eq("processing_status", "processed").limit(20).execute()
+        if existing.data:
+            context += "\n\nOTHER DOCUMENTS ALREADY PROCESSED FOR THIS PROJECT (use for cross-referencing):\n"
+            for e in existing.data:
+                context += f"- {e['doc_no']}: {e.get('summary', '')[:100]}\n"
+
+        content.append({"type": "text", "text": context})
+
+        # Call Claude
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            system=DOC_EXTRACTION_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r'^```(?:json)?\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+        data = json.loads(raw)
+
+        # Generate cross-document insights
+        cross_insights = []
+        if existing.data and data.get("specs"):
+            for spec in data["specs"]:
+                for e in existing.data:
+                    for es in (e.get("specs") or []):
+                        if es.get("param") == spec.get("param") and es.get("value") != spec.get("value"):
+                            cross_insights.append(f"{spec['param']}: {doc_no} says {spec.get('value')}{spec.get('unit','')} vs {e['doc_no']} says {es.get('value')}{es.get('unit','')}")
+
+        # Update record
+        if dk_id:
+            supabase.table("doc_knowledge").update({
+                "summary": data.get("summary", ""),
+                "category": data.get("category", "engineering"),
+                "specs": json.dumps(data.get("specs", [])),
+                "quantities": json.dumps(data.get("quantities", [])),
+                "vendors": json.dumps(data.get("vendors", [])),
+                "dates": json.dumps(data.get("dates", [])),
+                "references": json.dumps(data.get("references", [])),
+                "decisions": json.dumps(data.get("decisions", [])),
+                "cross_doc_insights": cross_insights[:10],
+                "tags": data.get("tags", []),
+                "raw_text_length": len(raw),
+                "processing_status": "processed",
+                "processed_at": json_now(),
+            }).eq("id", dk_id).execute()
+
+        print(f"[DOC] Done: {doc_no} — {data.get('category', '?')} — {len(data.get('specs', []))} specs, {len(data.get('quantities', []))} quantities")
+
+    except Exception as e:
+        print(f"[DOC] Error processing {filename}: {e}")
+        if dk_id:
+            supabase.table("doc_knowledge").update({
+                "processing_status": "failed",
+                "error_message": str(e)[:500],
+                "processed_at": json_now(),
+            }).eq("id", dk_id).execute()
+
+
+def json_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.route("/process-document", methods=["POST"])
+def process_document():
+    """Webhook endpoint called when a new document file is uploaded."""
+    data = request.get_json(silent=True) or {}
+    file_id = data.get("file_id")
+    document_id = data.get("document_id")
+    filename = data.get("filename", "")
+    file_url = data.get("file_url", "")
+
+    if not file_id or not document_id:
+        return {"error": "file_id and document_id required"}, 400
+
+    # Process in background
+    threading.Thread(
+        target=process_document_file,
+        args=(file_id, document_id, filename, file_url),
+        daemon=True,
+    ).start()
+
+    return {"status": "processing", "file_id": file_id}, 202
+
+
+@app.route("/process-all-documents", methods=["POST"])
+def process_all_documents():
+    """Bulk process all existing document files that haven't been processed yet."""
+    # Get all files that don't have a doc_knowledge record
+    files = supabase.table("document_files").select("id, document_id, filename, file_url").execute()
+    processed = supabase.table("doc_knowledge").select("document_file_id").execute()
+    processed_ids = set(r["document_file_id"] for r in (processed.data or []))
+
+    unprocessed = [f for f in (files.data or []) if f["id"] not in processed_ids]
+    print(f"[DOC] Bulk processing {len(unprocessed)} unprocessed files")
+
+    def process_batch():
+        import time
+        for i, f in enumerate(unprocessed):
+            process_document_file(f["id"], f["document_id"], f["filename"], f["file_url"])
+            if (i + 1) % 4 == 0:
+                time.sleep(15)  # Rate limit: 5 req/min on Anthropic
+
+    threading.Thread(target=process_batch, daemon=True).start()
+
+    return {"status": "processing", "total": len(unprocessed)}, 202
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return "Floatex WhatsApp Bot is running (v2 — Vision + Knowledge Base)", 200
+    return "Floatex WhatsApp Bot + Document Processor running", 200
 
 
 if __name__ == "__main__":
