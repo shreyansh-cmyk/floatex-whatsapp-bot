@@ -234,8 +234,8 @@ def store_media_analysis(message_id, media_url, media_type, analysis, project_id
         print(f"Error storing media analysis: {e}")
 
 
-def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name, image_data=None):
-    """Use Claude to extract knowledge and detect alerts from the message."""
+def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name):
+    """Use Claude to extract knowledge and detect alerts from the message. Text-only — no images to save tokens."""
     # Build context for extraction
     context_parts = []
     if body:
@@ -250,22 +250,12 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
     if group_name:
         context = f"From group: {group_name}\nSender: {sender}\n{context}"
 
-    # Build message content — include images if available for direct inspection
-    content = []
-    if image_data:
-        for b64_data, media_type in image_data:
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": b64_data},
-            })
-    content.append({"type": "text", "text": context})
-
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=EXTRACTION_PROMPT,
-            messages=[{"role": "user", "content": content}],
+            messages=[{"role": "user", "content": context}],
         )
         raw = response.content[0].text.strip()
         # Clean markdown code fences if present
@@ -397,7 +387,6 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
     """Heavy processing: image analysis, knowledge extraction, alerts — runs in background thread."""
     try:
         image_analyses = []
-        image_data = []  # (b64, media_type) tuples for extraction
 
         # Analyze images with Claude Vision
         for i, url in enumerate(media_urls):
@@ -407,19 +396,17 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
                 b64_data, detected_type = fetch_image_as_base64(url)
                 analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
                 image_analyses.append(analysis)
-                image_data.append((b64_data, detected_type))
 
                 if message_id:
                     store_media_analysis(message_id, url, detected_type, analysis, project_id)
             except Exception as e:
                 print(f"[BG] Image analysis failed for {url}: {e}")
 
-        # Extract knowledge + detect alerts (pass images for direct inspection)
+        # Extract knowledge + detect alerts (text-only to save tokens)
         alerts = []
         if message_id and (incoming_msg or image_analyses):
             alerts = extract_and_store_knowledge(
                 message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
-                image_data=image_data,
             )
 
         # Dispatch alerts
@@ -440,54 +427,36 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
 
 # --- Async Reply (via Twilio API, not TwiML) ---
 
-def send_reply_async(message_id, incoming_msg, media_urls, media_types, sender):
-    """Generate Claude reply and send via Twilio API — runs in background thread."""
+def send_reply_async(message_id, incoming_msg, sender, image_analyses=None):
+    """Send reply via Twilio API. Reuses Vision analysis for images (no extra API call)."""
     try:
-        if sender not in conversations:
-            conversations[sender] = []
+        if image_analyses:
+            # Reuse the Vision analysis as the reply — no extra Claude call
+            reply = "\n\n".join(image_analyses)
+        elif incoming_msg:
+            # Text-only: need a Claude call
+            if sender not in conversations:
+                conversations[sender] = []
 
-        content = []
-        for i, url in enumerate(media_urls):
-            if not media_types[i].startswith("image/"):
-                continue
-            try:
-                b64_data, detected_type = fetch_image_as_base64(url)
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": detected_type, "data": b64_data},
-                })
-            except Exception as e:
-                print(f"[REPLY] Image fetch failed: {e}")
+            conversations[sender].append({"role": "user", "content": incoming_msg})
 
-        if incoming_msg:
-            content.append({"type": "text", "text": incoming_msg})
-        elif content:
-            content.append({
-                "type": "text",
-                "text": "Analyze this site photo. Identify progress, issues, safety concerns, and any observations.",
-            })
+            if len(conversations[sender]) > 10:
+                conversations[sender] = conversations[sender][-10:]
 
-        if not content:
+            response = claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=conversations[sender],
+            )
+            reply = response.content[0].text
+            conversations[sender].append({"role": "assistant", "content": reply})
+        else:
             return
-
-        conversations[sender].append({"role": "user", "content": content})
-
-        if len(conversations[sender]) > 10:
-            conversations[sender] = conversations[sender][-10:]
-
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=conversations[sender],
-        )
-        reply = response.content[0].text
 
         # Truncate for WhatsApp limit
         if len(reply) > 1500:
             reply = reply[:1497] + "..."
-
-        conversations[sender].append({"role": "assistant", "content": reply})
 
         # Send via Twilio API
         twilio_client.messages.create(
@@ -562,7 +531,7 @@ def process_all_in_background(form_data):
         # Reply if needed
         should_reply = not is_group or is_bot_tagged(incoming_msg)
         if should_reply:
-            send_reply_async(message_id, incoming_msg, media_urls, media_types, sender)
+            send_reply_async(message_id, incoming_msg, sender, image_analyses=image_analyses or None)
 
     except Exception as e:
         print(f"[BG] Error: {e}")
