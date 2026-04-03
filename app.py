@@ -107,9 +107,12 @@ Return a JSON object with these fields:
 
 Rules:
 - Only extract real, actionable information. Skip greetings, acknowledgements, chit-chat.
-- "alerts" should only contain genuine concerns that need attention. Don't over-alert.
+- BE VIGILANT about issues. If the image analysis mentions ANY concern, recommendation, missing item, or deviation — even softly worded ones like "check that..." or "ensure..." or "recommend..." — create an alert for it. These "recommendations" often indicate real problems observed.
+- Missing hardware (washers, bolts, clamps), incorrect installation, deviations from spec = at minimum MEDIUM alert.
+- Missing safety equipment (PPE, life jackets) = HIGH alert.
 - critical = immediate danger or major financial impact. high = needs action within 24h. medium = should be addressed soon. low = FYI.
-- If the message is routine with no extractable info, return empty arrays.
+- When in doubt, create the alert. It's better to over-alert than to miss a real issue.
+- If the message is truly routine with no extractable info, return empty arrays.
 - Return ONLY valid JSON, no markdown, no explanation."""
 
 
@@ -231,7 +234,7 @@ def store_media_analysis(message_id, media_url, media_type, analysis, project_id
         print(f"Error storing media analysis: {e}")
 
 
-def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name):
+def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name, image_data=None):
     """Use Claude to extract knowledge and detect alerts from the message."""
     # Build context for extraction
     context_parts = []
@@ -247,12 +250,22 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
     if group_name:
         context = f"From group: {group_name}\nSender: {sender}\n{context}"
 
+    # Build message content — include images if available for direct inspection
+    content = []
+    if image_data:
+        for b64_data, media_type in image_data:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64_data},
+            })
+    content.append({"type": "text", "text": context})
+
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=EXTRACTION_PROMPT,
-            messages=[{"role": "user", "content": context}],
+            messages=[{"role": "user", "content": content}],
         )
         raw = response.content[0].text.strip()
         # Clean markdown code fences if present
@@ -384,6 +397,7 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
     """Heavy processing: image analysis, knowledge extraction, alerts — runs in background thread."""
     try:
         image_analyses = []
+        image_data = []  # (b64, media_type) tuples for extraction
 
         # Analyze images with Claude Vision
         for i, url in enumerate(media_urls):
@@ -393,17 +407,19 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
                 b64_data, detected_type = fetch_image_as_base64(url)
                 analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
                 image_analyses.append(analysis)
+                image_data.append((b64_data, detected_type))
 
                 if message_id:
                     store_media_analysis(message_id, url, detected_type, analysis, project_id)
             except Exception as e:
                 print(f"[BG] Image analysis failed for {url}: {e}")
 
-        # Extract knowledge + detect alerts
+        # Extract knowledge + detect alerts (pass images for direct inspection)
         alerts = []
         if message_id and (incoming_msg or image_analyses):
             alerts = extract_and_store_knowledge(
                 message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
+                image_data=image_data,
             )
 
         # Dispatch alerts
