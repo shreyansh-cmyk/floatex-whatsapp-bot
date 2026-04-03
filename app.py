@@ -422,6 +422,72 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
         print(f"[BG] Background processing error: {e}")
 
 
+# --- Async Reply (via Twilio API, not TwiML) ---
+
+def send_reply_async(message_id, incoming_msg, media_urls, media_types, sender):
+    """Generate Claude reply and send via Twilio API — runs in background thread."""
+    try:
+        if sender not in conversations:
+            conversations[sender] = []
+
+        content = []
+        for i, url in enumerate(media_urls):
+            if not media_types[i].startswith("image/"):
+                continue
+            try:
+                b64_data, detected_type = fetch_image_as_base64(url)
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": detected_type, "data": b64_data},
+                })
+            except Exception as e:
+                print(f"[REPLY] Image fetch failed: {e}")
+
+        if incoming_msg:
+            content.append({"type": "text", "text": incoming_msg})
+        elif content:
+            content.append({
+                "type": "text",
+                "text": "Analyze this site photo. Identify progress, issues, safety concerns, and any observations.",
+            })
+
+        if not content:
+            return
+
+        conversations[sender].append({"role": "user", "content": content})
+
+        if len(conversations[sender]) > 10:
+            conversations[sender] = conversations[sender][-10:]
+
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=conversations[sender],
+        )
+        reply = response.content[0].text
+
+        # Truncate for WhatsApp limit
+        if len(reply) > 1500:
+            reply = reply[:1497] + "..."
+
+        conversations[sender].append({"role": "assistant", "content": reply})
+
+        # Send via Twilio API
+        twilio_client.messages.create(
+            from_=BOT_NUMBER,
+            to=sender,
+            body=reply,
+        )
+        print(f"[REPLY] Sent to {sender} ({len(reply)} chars)")
+
+        if message_id:
+            supabase.table("whatsapp_messages").update({"bot_responded": True}).eq("id", message_id).execute()
+
+    except Exception as e:
+        print(f"[REPLY] Error: {e}")
+
+
 # --- Main Webhook ---
 
 @app.route("/webhook", methods=["POST"])
@@ -469,62 +535,17 @@ def webhook():
     # --- 4. Reply only if tagged (in groups) or always (in DMs) ---
     should_reply = not is_group or is_bot_tagged(incoming_msg)
 
-    if not should_reply:
-        return str(MessagingResponse())
-
-    # Build conversation content — for DMs with images, fetch and include them
-    if sender not in conversations:
-        conversations[sender] = []
-
-    content = []
-    for i, url in enumerate(media_urls):
-        if not media_types[i].startswith("image/"):
-            continue
-        try:
-            b64_data, detected_type = fetch_image_as_base64(url)
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": detected_type, "data": b64_data},
-            })
-        except Exception as e:
-            print(f"Image fetch for reply failed: {e}")
-
-    if incoming_msg:
-        content.append({"type": "text", "text": incoming_msg})
-    elif content:
-        content.append({
-            "type": "text",
-            "text": "Analyze this site photo. Identify progress, issues, safety concerns, and any observations.",
-        })
-
-    if not content:
-        return str(MessagingResponse())
-
-    conversations[sender].append({"role": "user", "content": content})
-
-    if len(conversations[sender]) > 10:
-        conversations[sender] = conversations[sender][-10:]
-
-    try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=conversations[sender],
+    if should_reply:
+        # Send reply in background via Twilio API (no timeout risk)
+        reply_thread = threading.Thread(
+            target=send_reply_async,
+            args=(message_id, incoming_msg, media_urls, media_types, sender),
+            daemon=True,
         )
-        reply = response.content[0].text
-        conversations[sender].append({"role": "assistant", "content": reply})
+        reply_thread.start()
 
-        if message_id:
-            supabase.table("whatsapp_messages").update({"bot_responded": True}).eq("id", message_id).execute()
-
-    except Exception as e:
-        print(f"Claude API error: {e}")
-        reply = "Sorry, I encountered an error. Please try again."
-
-    resp = MessagingResponse()
-    resp.message(reply)
-    return str(resp)
+    # Always return empty TwiML immediately — replies sent via Twilio API
+    return str(MessagingResponse())
 
 
 @app.route("/", methods=["GET"])
