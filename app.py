@@ -914,9 +914,9 @@ def process_all_documents():
     def process_batch():
         import time
         for i, f in enumerate(unprocessed):
+            print(f"[DOC] Batch {i+1}/{len(unprocessed)}: {f['filename']}")
             process_document_file(f["id"], f["document_id"], f["filename"], f["file_url"])
-            if (i + 1) % 4 == 0:
-                time.sleep(15)  # Rate limit: 5 req/min on Anthropic
+            time.sleep(60)  # 1 doc per minute — safe for 10k tokens/min limit
 
     threading.Thread(target=process_batch, daemon=True).start()
 
