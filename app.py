@@ -272,7 +272,8 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
         print(f"Extraction error: {e}")
         return []
 
-    extracted_project = data.get("project_id") or project_id
+    # Use project_id from message detection (validated), fall back to extracted but don't trust it for FK
+    extracted_project = project_id  # Only use the one we detected from message text (matches projects table)
     alerts = []
 
     # Store knowledge
@@ -597,25 +598,33 @@ def process_all_in_background(form_data):
         )
         print(f"[BG] Stored message {message_id} from {sender_name}")
 
-        # Image analysis, knowledge extraction, alerts
+        # Build memory context from accumulated knowledge
+        memory = build_memory_context(project_id)
+        enriched_system = SYSTEM_PROMPT
+        if memory:
+            enriched_system = SYSTEM_PROMPT + "\n\n" + memory
+            print(f"[BG] Memory context: {len(memory)} chars injected")
+
+        # Image analysis with accumulated knowledge
         image_analyses = []
         for i, url in enumerate(media_urls):
             if not media_types[i].startswith("image/"):
                 continue
             try:
                 b64_data, detected_type = fetch_image_as_base64(url)
-                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
+                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg, system_prompt=enriched_system)
                 image_analyses.append(analysis)
                 if message_id:
                     store_media_analysis(message_id, url, detected_type, analysis, project_id)
             except Exception as e:
                 print(f"[BG] Image analysis failed for {url}: {e}")
 
-        # Knowledge extraction + alerts
+        # Knowledge extraction + alerts (with memory for pattern awareness)
         alerts = []
         if message_id and (incoming_msg or image_analyses):
             alerts = extract_and_store_knowledge(
                 message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
+                memory=memory,
             )
 
         for alert in alerts:
