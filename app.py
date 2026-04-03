@@ -923,9 +923,213 @@ def process_all_documents():
     return {"status": "processing", "total": len(unprocessed)}, 202
 
 
+# --- Skill Execution API ---
+
+@app.route("/api/skills/<skill_slug>", methods=["POST"])
+def execute_skill(skill_slug):
+    """Execute a skill with project context and learned knowledge."""
+    data = request.get_json(silent=True) or {}
+    project_id = data.get("project_id")
+    triggered_by = data.get("triggered_by", "portal")
+    input_data = data.get("input", {})
+
+    # Fetch skill
+    skill_result = supabase.table("skills").select("*").eq("slug", skill_slug).eq("is_active", True).single().execute()
+    if not skill_result.data:
+        return {"error": f"Skill '{skill_slug}' not found"}, 404
+    skill = skill_result.data
+
+    # Create execution record
+    exec_result = supabase.table("skill_executions").insert({
+        "skill_id": skill["id"],
+        "project_id": project_id,
+        "triggered_by": triggered_by,
+        "input_data": input_data,
+        "status": "running",
+    }).execute()
+    exec_id = exec_result.data[0]["id"] if exec_result.data else None
+
+    # Run in background
+    threading.Thread(
+        target=run_skill,
+        args=(exec_id, skill, project_id, input_data),
+        daemon=True,
+    ).start()
+
+    return {"status": "running", "execution_id": exec_id}, 202
+
+
+def run_skill(exec_id, skill, project_id, input_data):
+    """Execute a skill with full context injection."""
+    import time
+    start = time.time()
+
+    try:
+        # 1. Build system prompt: base skill + learned context
+        system = skill["base_prompt"]
+        if skill.get("learned_context"):
+            system += "\n\n--- LEARNED FROM RECENT DOCUMENTS ---\n" + skill["learned_context"]
+
+        # 2. Fetch project context from Supabase
+        context_parts = []
+
+        if project_id:
+            # Project data
+            proj = supabase.table("projects").select("*").eq("id", project_id).single().execute()
+            if proj.data:
+                context_parts.append(f"PROJECT: {proj.data.get('id')} — {proj.data.get('name')} ({proj.data.get('full_name','')})")
+                context_parts.append(f"GWM Ref: {proj.data.get('gwm_ref','')} | EPC: {proj.data.get('epc','')} | Consultant: {proj.data.get('epc_consultant_org','')}")
+
+            # Relevant doc_knowledge
+            dk = supabase.table("doc_knowledge").select("doc_no, summary, category, specs, decisions").eq("project_id", project_id).eq("processing_status", "processed").limit(20).execute()
+            dk_ids = []
+            if dk.data:
+                context_parts.append("\nPROJECT DOCUMENTS KNOWLEDGE:")
+                for d in dk.data:
+                    dk_ids.append(d.get("id"))
+                    context_parts.append(f"  [{d['doc_no']}] ({d['category']}): {(d.get('summary') or '')[:150]}")
+                    specs = d.get("specs") or []
+                    if isinstance(specs, str):
+                        try: specs = json.loads(specs)
+                        except: specs = []
+                    for s in specs[:3]:
+                        context_parts.append(f"    - {s.get('param','')}: {s.get('value','')} {s.get('unit','')}")
+
+            # Relevant wa_knowledge
+            wk = supabase.table("wa_knowledge").select("category, fact").eq("is_current", True).limit(15).execute()
+            if wk.data:
+                context_parts.append("\nFIELD OBSERVATIONS (from WhatsApp):")
+                for w in wk.data:
+                    context_parts.append(f"  [{w['category']}] {w['fact']}")
+
+            # Recent alerts
+            alerts = supabase.table("wa_alerts").select("severity, title").in_("status", ["new", "acknowledged"]).limit(5).execute()
+            if alerts.data:
+                context_parts.append("\nACTIVE ALERTS:")
+                for a in alerts.data:
+                    context_parts.append(f"  [{a['severity'].upper()}] {a['title']}")
+
+        # 3. Build user message
+        user_message = "\n".join(context_parts) if context_parts else ""
+        if input_data:
+            user_message += "\n\nUSER INPUT:\n" + json.dumps(input_data, indent=2)
+
+        # 4. Call Claude
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=system,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        output_text = response.content[0].text
+        tokens = (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0)
+
+        elapsed = int((time.time() - start) * 1000)
+
+        # 5. Try to extract structured data
+        output_structured = None
+        try:
+            # Look for JSON block in output
+            if "```json" in output_text:
+                json_match = re.search(r'```json\s*(.*?)\s*```', output_text, re.DOTALL)
+                if json_match:
+                    output_structured = json.loads(json_match.group(1))
+        except:
+            pass
+
+        # 6. Update execution record
+        if exec_id:
+            supabase.table("skill_executions").update({
+                "output_text": output_text,
+                "output_structured": json.dumps(output_structured) if output_structured else None,
+                "doc_knowledge_ids": dk_ids[:10] if project_id else [],
+                "tokens_used": tokens,
+                "execution_time_ms": elapsed,
+                "status": "completed",
+            }).eq("id", exec_id).execute()
+
+        # 7. Check if skill should learn from this execution
+        check_skill_learning(skill, output_text, input_data, project_id)
+
+        print(f"[SKILL] {skill['slug']} completed — {tokens} tokens, {elapsed}ms")
+
+    except Exception as e:
+        print(f"[SKILL] Error: {e}")
+        if exec_id:
+            supabase.table("skill_executions").update({
+                "status": "failed",
+                "error_message": str(e)[:500],
+            }).eq("id", exec_id).execute()
+
+
+def check_skill_learning(skill, output_text, input_data, project_id):
+    """After a skill runs, check if the output contains patterns worth learning."""
+    try:
+        # Ask Claude to extract learnable patterns
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=512,
+            system="You extract reusable patterns from skill execution outputs. Return JSON array of learnings, or empty array if nothing new.",
+            messages=[{"role": "user", "content": f"Skill: {skill['slug']}\nInput: {json.dumps(input_data)[:500]}\nOutput excerpt: {output_text[:2000]}\n\nExtract any new reusable patterns (comment templates, formulas, vendor data, workflow steps) that should be remembered for next time. Return: [{{'type': 'comment_pattern|spec_update|formula|vendor_data|workflow_change', 'content': 'the learning'}}] or []"}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r'^```(?:json)?\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+        learnings = json.loads(raw)
+
+        for l in (learnings or []):
+            if l.get("content"):
+                supabase.table("skill_learnings").insert({
+                    "skill_id": skill["id"],
+                    "source_doc_no": input_data.get("document_no", ""),
+                    "learning_type": l.get("type", "spec_update"),
+                    "learning_content": l["content"],
+                }).execute()
+
+        # Periodically merge learnings into skill's learned_context
+        pending = supabase.table("skill_learnings").select("id, learning_content").eq("skill_id", skill["id"]).eq("applied", False).limit(20).execute()
+        if pending.data and len(pending.data) >= 3:
+            new_context = "\n".join(f"- {p['learning_content']}" for p in pending.data)
+            existing = skill.get("learned_context", "") or ""
+            merged = (existing + "\n" + new_context).strip()
+            # Keep learned_context under 5000 chars
+            if len(merged) > 5000:
+                merged = merged[-5000:]
+            supabase.table("skills").update({
+                "learned_context": merged,
+                "version": (skill.get("version", 1) or 1) + 1,
+                "updated_at": json_now(),
+            }).eq("id", skill["id"]).execute()
+            # Mark as applied
+            for p in pending.data:
+                supabase.table("skill_learnings").update({"applied": True}).eq("id", p["id"]).execute()
+            print(f"[SKILL] {skill['slug']} learned {len(pending.data)} new patterns (v{skill.get('version',1)+1})")
+
+    except Exception as e:
+        print(f"[SKILL] Learning check error: {e}")
+
+
+@app.route("/api/skills", methods=["GET"])
+def list_skills():
+    """List all active skills."""
+    result = supabase.table("skills").select("id, slug, name, description, category, version, input_schema, updated_at").eq("is_active", True).execute()
+    return {"skills": result.data or []}, 200
+
+
+@app.route("/api/skills/<skill_slug>/executions", methods=["GET"])
+def list_executions(skill_slug):
+    """List recent executions for a skill."""
+    skill = supabase.table("skills").select("id").eq("slug", skill_slug).single().execute()
+    if not skill.data:
+        return {"error": "Skill not found"}, 404
+    result = supabase.table("skill_executions").select("*").eq("skill_id", skill.data["id"]).order("created_at", desc=True).limit(20).execute()
+    return {"executions": result.data or []}, 200
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return "Floatex WhatsApp Bot + Document Processor running", 200
+    return "Floatex Intelligence Platform — Bot + Docs + Skills", 200
 
 
 if __name__ == "__main__":
