@@ -727,9 +727,23 @@ def process_document_file(file_id, document_id, filename, file_url):
         }).execute()
         dk_id = dk_result.data[0]["id"] if dk_result.data else None
 
-        # Fetch file from Supabase storage
-        file_response = supabase.storage.from_("portal-files").download(file_url)
-        file_bytes = file_response
+        # Fetch file from Supabase storage via signed URL
+        signed_result = supabase.storage.from_("portal-files").create_signed_url(file_url, 300)
+        # Handle various return formats
+        if isinstance(signed_result, dict):
+            signed_url = signed_result.get("signedURL") or signed_result.get("signedUrl") or signed_result.get("signed_url")
+        elif hasattr(signed_result, 'signed_url'):
+            signed_url = signed_result.signed_url
+        else:
+            signed_url = str(signed_result) if signed_result else None
+        if not signed_url or signed_url == 'None':
+            raise Exception(f"Could not create signed URL for {file_url}: {signed_result}")
+        dl_response = httpx.get(signed_url, follow_redirects=True, timeout=60)
+        if dl_response.status_code != 200:
+            raise Exception(f"Download failed: HTTP {dl_response.status_code}")
+        file_bytes = dl_response.content
+        if len(file_bytes) < 100:
+            raise Exception(f"File too small ({len(file_bytes)} bytes), likely download error")
 
         is_pdf = filename.lower().endswith(".pdf")
         is_image = any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"])
