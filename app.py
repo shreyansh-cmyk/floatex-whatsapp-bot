@@ -1,11 +1,15 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
+import httpx
+import base64
 import os
 
 app = Flask(__name__)
 
 claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
 conversations = {}
 
@@ -45,6 +49,14 @@ WHEN RECEIVING A DAILY PROGRESS REPORT (DPR):
 - Summarize tomorrow plan
 - Keep response concise and structured
 
+SITE INSPECTION (when receiving photos):
+- Analyze the image for: structural integrity, safety hazards, installation progress, material condition, workmanship quality
+- For floating solar: check float alignment, mooring lines, panel orientation, cable routing, water conditions
+- Flag any safety concerns (missing PPE, exposed wiring, unstable structures)
+- Note weather/environmental conditions visible in the photo
+- If multiple images are sent, analyze each and provide a combined report
+- Compare against known project specs when possible
+
 RESPONSE STYLE:
 - Be concise - this is WhatsApp, keep replies under 300 words unless more detail is requested
 - Use emojis sparingly for status indicators
@@ -54,21 +66,63 @@ RESPONSE STYLE:
 """
 
 
+def fetch_image_as_base64(media_url):
+    """Fetch an image from Twilio and return (base64_data, media_type)."""
+    response = httpx.get(
+        media_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        follow_redirects=True,
+    )
+    media_type = response.headers.get("content-type", "image/jpeg")
+    b64 = base64.standard_b64encode(response.content).decode("utf-8")
+    return b64, media_type
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_msg = request.form.get("Body", "").strip()
     sender = request.form.get("From", "")
+    num_media = int(request.form.get("NumMedia", 0))
 
-    if not incoming_msg:
+    if not incoming_msg and num_media == 0:
         return str(MessagingResponse())
 
     if sender not in conversations:
         conversations[sender] = []
 
-    conversations[sender].append({
-        "role": "user",
-        "content": incoming_msg
-    })
+    # Build message content (text + images)
+    content = []
+
+    for i in range(num_media):
+        media_url = request.form.get(f"MediaUrl{i}")
+        media_content_type = request.form.get(f"MediaContentType{i}", "image/jpeg")
+        if media_url and media_content_type.startswith("image/"):
+            try:
+                b64_data, detected_type = fetch_image_as_base64(media_url)
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": detected_type,
+                        "data": b64_data,
+                    },
+                })
+            except Exception as e:
+                print(f"Failed to fetch image {i}: {e}")
+
+    if incoming_msg:
+        content.append({"type": "text", "text": incoming_msg})
+    elif content:
+        # Image with no caption — ask for inspection analysis
+        content.append({
+            "type": "text",
+            "text": "Analyze this site photo. Identify progress, issues, safety concerns, and any observations.",
+        })
+
+    if not content:
+        return str(MessagingResponse())
+
+    conversations[sender].append({"role": "user", "content": content})
 
     if len(conversations[sender]) > 10:
         conversations[sender] = conversations[sender][-10:]
@@ -78,16 +132,17 @@ def webhook():
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=SYSTEM_PROMPT,
-            messages=conversations[sender]
+            messages=conversations[sender],
         )
         reply = response.content[0].text
 
         conversations[sender].append({
             "role": "assistant",
-            "content": reply
+            "content": reply,
         })
 
     except Exception as e:
+        print(f"Claude API error: {e}")
         reply = "Sorry, I encountered an error. Please try again."
 
     resp = MessagingResponse()
