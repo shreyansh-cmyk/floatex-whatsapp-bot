@@ -12,6 +12,13 @@ import threading
 
 app = Flask(__name__)
 
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
 # --- Clients ---
 claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
