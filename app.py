@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import threading
 
 app = Flask(__name__)
 
@@ -377,6 +378,50 @@ def send_group_alert(alert, group_sender):
         print(f"Failed to send group alert: {e}")
 
 
+# --- Background Processing ---
+
+def process_in_background(message_id, incoming_msg, media_urls, media_types, project_id, sender, sender_name, group_id, group_name, is_group):
+    """Heavy processing: image analysis, knowledge extraction, alerts — runs in background thread."""
+    try:
+        image_analyses = []
+
+        # Analyze images with Claude Vision
+        for i, url in enumerate(media_urls):
+            if not media_types[i].startswith("image/"):
+                continue
+            try:
+                b64_data, detected_type = fetch_image_as_base64(url)
+                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
+                image_analyses.append(analysis)
+
+                if message_id:
+                    store_media_analysis(message_id, url, detected_type, analysis, project_id)
+            except Exception as e:
+                print(f"[BG] Image analysis failed for {url}: {e}")
+
+        # Extract knowledge + detect alerts
+        alerts = []
+        if message_id and (incoming_msg or image_analyses):
+            alerts = extract_and_store_knowledge(
+                message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
+            )
+
+        # Dispatch alerts
+        for alert in alerts:
+            send_proactive_alert(alert)
+            if is_group:
+                send_group_alert(alert, sender)
+
+        # Mark processed
+        if message_id:
+            supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
+
+        print(f"[BG] Processed message {message_id}: {len(image_analyses)} images, {len(alerts)} alerts")
+
+    except Exception as e:
+        print(f"[BG] Background processing error: {e}")
+
+
 # --- Main Webhook ---
 
 @app.route("/webhook", methods=["POST"])
@@ -412,71 +457,50 @@ def webhook():
         incoming_msg, num_media, media_urls, media_types, message_sid,
     )
 
-    # --- 3. Analyze images with Claude Vision ---
-    image_analyses = []
-    image_contents = []  # for reply if tagged
-    for i, url in enumerate(media_urls):
-        if not media_types[i].startswith("image/"):
-            continue
-        try:
-            b64_data, detected_type = fetch_image_as_base64(url)
-            analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
-            image_analyses.append(analysis)
-            image_contents.append((b64_data, detected_type))
+    # --- 3. Kick off background processing (image analysis, knowledge, alerts) ---
+    bg_thread = threading.Thread(
+        target=process_in_background,
+        args=(message_id, incoming_msg, media_urls, media_types, project_id,
+              sender, sender_name, group_id, group_name, is_group),
+        daemon=True,
+    )
+    bg_thread.start()
 
-            # Store analysis
-            if message_id:
-                store_media_analysis(message_id, url, detected_type, analysis, project_id)
-        except Exception as e:
-            print(f"Image analysis failed for {url}: {e}")
-
-    # --- 4. Extract knowledge + detect alerts ---
-    alerts = []
-    if message_id and (incoming_msg or image_analyses):
-        alerts = extract_and_store_knowledge(
-            message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
-        )
-
-    # --- 5. Dispatch alerts ---
-    for alert in alerts:
-        send_proactive_alert(alert)
-        if is_group:
-            send_group_alert(alert, sender)
-
-    # --- 6. Mark message as processed ---
-    if message_id:
-        try:
-            supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
-        except Exception as e:
-            print(f"Error marking processed: {e}")
-
-    # --- 7. Reply only if tagged (in groups) or always (in DMs) ---
+    # --- 4. Reply only if tagged (in groups) or always (in DMs) ---
     should_reply = not is_group or is_bot_tagged(incoming_msg)
 
     if not should_reply:
         return str(MessagingResponse())
 
-    # Build conversation context
+    # Build conversation content — for DMs with images, fetch and include them
     if sender not in conversations:
         conversations[sender] = []
 
     content = []
-    for b64_data, detected_type in image_contents:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": detected_type, "data": b64_data},
-        })
+    for i, url in enumerate(media_urls):
+        if not media_types[i].startswith("image/"):
+            continue
+        try:
+            b64_data, detected_type = fetch_image_as_base64(url)
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": detected_type, "data": b64_data},
+            })
+        except Exception as e:
+            print(f"Image fetch for reply failed: {e}")
 
     if incoming_msg:
         content.append({"type": "text", "text": incoming_msg})
-    elif image_contents:
+    elif content:
         content.append({
             "type": "text",
             "text": "Analyze this site photo. Identify progress, issues, safety concerns, and any observations.",
         })
 
-    if content:
-        conversations[sender].append({"role": "user", "content": content})
+    if not content:
+        return str(MessagingResponse())
+
+    conversations[sender].append({"role": "user", "content": content})
 
     if len(conversations[sender]) > 10:
         conversations[sender] = conversations[sender][-10:]
@@ -491,7 +515,6 @@ def webhook():
         reply = response.content[0].text
         conversations[sender].append({"role": "assistant", "content": reply})
 
-        # Mark that bot responded
         if message_id:
             supabase.table("whatsapp_messages").update({"bot_responded": True}).eq("id", message_id).execute()
 
