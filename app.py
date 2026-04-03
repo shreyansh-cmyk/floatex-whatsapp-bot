@@ -490,61 +490,96 @@ def send_reply_async(message_id, incoming_msg, media_urls, media_types, sender):
 
 # --- Main Webhook ---
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    incoming_msg = request.form.get("Body", "").strip()
-    sender = request.form.get("From", "")
-    sender_name = request.form.get("ProfileName", "")
-    num_media = int(request.form.get("NumMedia", 0))
-    message_sid = request.form.get("MessageSid", "")
-
-    # Group detection
-    group_id = request.form.get("GroupId", None)
-    group_name = request.form.get("GroupName", None)
+def process_all_in_background(form_data):
+    """All processing in one background thread: store, analyze, extract, reply."""
+    incoming_msg = form_data.get("body", "").strip()
+    sender = form_data["sender"]
+    sender_name = form_data.get("sender_name", "")
+    num_media = form_data.get("num_media", 0)
+    message_sid = form_data.get("message_sid", "")
+    group_id = form_data.get("group_id")
+    group_name = form_data.get("group_name")
+    media_urls = form_data.get("media_urls", [])
+    media_types = form_data.get("media_types", [])
     is_group = bool(group_id)
 
-    if not incoming_msg and num_media == 0:
-        return str(MessagingResponse())
+    try:
+        # Store message
+        project_id = detect_project_id(incoming_msg)
+        message_id = store_message(
+            sender, sender_name, group_id, group_name,
+            incoming_msg, num_media, media_urls, media_types, message_sid,
+        )
+        print(f"[BG] Stored message {message_id} from {sender_name}")
 
-    # --- 1. Collect media URLs ---
-    media_urls = []
-    media_types = []
-    for i in range(num_media):
+        # Image analysis, knowledge extraction, alerts
+        image_analyses = []
+        for i, url in enumerate(media_urls):
+            if not media_types[i].startswith("image/"):
+                continue
+            try:
+                b64_data, detected_type = fetch_image_as_base64(url)
+                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
+                image_analyses.append(analysis)
+                if message_id:
+                    store_media_analysis(message_id, url, detected_type, analysis, project_id)
+            except Exception as e:
+                print(f"[BG] Image analysis failed for {url}: {e}")
+
+        # Knowledge extraction + alerts
+        alerts = []
+        if message_id and (incoming_msg or image_analyses):
+            alerts = extract_and_store_knowledge(
+                message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
+            )
+
+        for alert in alerts:
+            send_proactive_alert(alert)
+            if is_group:
+                send_group_alert(alert, sender)
+
+        if message_id:
+            supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
+
+        print(f"[BG] Processed: {len(image_analyses)} images, {len(alerts)} alerts")
+
+        # Reply if needed
+        should_reply = not is_group or is_bot_tagged(incoming_msg)
+        if should_reply:
+            send_reply_async(message_id, incoming_msg, media_urls, media_types, sender)
+
+    except Exception as e:
+        print(f"[BG] Error: {e}")
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # Capture all form data immediately, then return
+    form_data = {
+        "body": request.form.get("Body", ""),
+        "sender": request.form.get("From", ""),
+        "sender_name": request.form.get("ProfileName", ""),
+        "num_media": int(request.form.get("NumMedia", 0)),
+        "message_sid": request.form.get("MessageSid", ""),
+        "group_id": request.form.get("GroupId", None),
+        "group_name": request.form.get("GroupName", None),
+        "media_urls": [],
+        "media_types": [],
+    }
+
+    for i in range(form_data["num_media"]):
         url = request.form.get(f"MediaUrl{i}")
         ctype = request.form.get(f"MediaContentType{i}", "")
         if url:
-            media_urls.append(url)
-            media_types.append(ctype)
+            form_data["media_urls"].append(url)
+            form_data["media_types"].append(ctype)
 
-    # --- 2. Store message in Supabase ---
-    project_id = detect_project_id(incoming_msg)
-    message_id = store_message(
-        sender, sender_name, group_id, group_name,
-        incoming_msg, num_media, media_urls, media_types, message_sid,
-    )
+    if not form_data["body"].strip() and form_data["num_media"] == 0:
+        return str(MessagingResponse())
 
-    # --- 3. Kick off background processing (image analysis, knowledge, alerts) ---
-    bg_thread = threading.Thread(
-        target=process_in_background,
-        args=(message_id, incoming_msg, media_urls, media_types, project_id,
-              sender, sender_name, group_id, group_name, is_group),
-        daemon=True,
-    )
-    bg_thread.start()
+    # Everything in background — return immediately
+    threading.Thread(target=process_all_in_background, args=(form_data,), daemon=True).start()
 
-    # --- 4. Reply only if tagged (in groups) or always (in DMs) ---
-    should_reply = not is_group or is_bot_tagged(incoming_msg)
-
-    if should_reply:
-        # Send reply in background via Twilio API (no timeout risk)
-        reply_thread = threading.Thread(
-            target=send_reply_async,
-            args=(message_id, incoming_msg, media_urls, media_types, sender),
-            daemon=True,
-        )
-        reply_thread.start()
-
-    # Always return empty TwiML immediately — replies sent via Twilio API
     return str(MessagingResponse())
 
 
