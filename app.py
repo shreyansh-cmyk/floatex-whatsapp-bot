@@ -190,13 +190,13 @@ def store_message(sender, sender_name, group_id, group_name, body, num_media, me
         return None
 
 
-def analyze_image_vision(b64_data, media_type, caption=""):
+def analyze_image_vision(b64_data, media_type, caption="", system_prompt=None):
     """Send image to Claude Vision and return analysis text."""
     prompt = caption or "Analyze this site photo from a floating solar project. Identify progress, issues, safety concerns, material conditions, and any notable observations."
     response = claude.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=system_prompt or SYSTEM_PROMPT,
         messages=[{
             "role": "user",
             "content": [
@@ -234,7 +234,7 @@ def store_media_analysis(message_id, media_url, media_type, analysis, project_id
         print(f"Error storing media analysis: {e}")
 
 
-def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name):
+def extract_and_store_knowledge(message_id, body, image_analyses, project_id, sender, group_name, memory=""):
     """Use Claude to extract knowledge and detect alerts from the message. Text-only — no images to save tokens."""
     # Build context for extraction
     context_parts = []
@@ -250,11 +250,16 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
     if group_name:
         context = f"From group: {group_name}\nSender: {sender}\n{context}"
 
+    # Inject memory so extraction knows about recurring patterns
+    extraction_system = EXTRACTION_PROMPT
+    if memory:
+        extraction_system = EXTRACTION_PROMPT + "\n\n" + memory
+
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
-            system=EXTRACTION_PROMPT,
+            system=extraction_system,
             messages=[{"role": "user", "content": context}],
         )
         raw = response.content[0].text.strip()
@@ -381,20 +386,114 @@ def send_group_alert(alert, group_sender):
         print(f"Failed to send group alert: {e}")
 
 
+# --- Knowledge Retrieval (Compounding Intelligence) ---
+
+def build_memory_context(project_id):
+    """Fetch accumulated knowledge from Supabase and build a context string for Claude."""
+    sections = []
+
+    try:
+        # 1. Recent knowledge for this project (or all if no project)
+        kq = supabase.table("wa_knowledge").select("category, fact, confidence, extracted_at").eq("is_current", True).order("extracted_at", desc=True).limit(30)
+        if project_id:
+            kq = kq.eq("project_id", project_id)
+        knowledge = kq.execute().data or []
+
+        if knowledge:
+            # Group by category
+            by_cat = {}
+            for k in knowledge:
+                cat = k["category"]
+                if cat not in by_cat:
+                    by_cat[cat] = []
+                by_cat[cat].append(k["fact"])
+
+            lines = ["ACCUMULATED KNOWLEDGE FROM PAST OBSERVATIONS:"]
+            for cat, facts in by_cat.items():
+                lines.append(f"\n[{cat.upper()}]")
+                for f in facts[:5]:  # Max 5 per category to limit tokens
+                    lines.append(f"- {f}")
+            sections.append("\n".join(lines))
+
+        # 2. Recent open alerts — so Claude knows what's already flagged
+        aq = supabase.table("wa_alerts").select("severity, category, title, status").in_("status", ["new", "acknowledged"]).order("created_at", desc=True).limit(10)
+        if project_id:
+            aq = aq.eq("project_id", project_id)
+        alerts = aq.execute().data or []
+
+        if alerts:
+            lines = ["\nCURRENTLY OPEN ALERTS (already flagged, don't duplicate):"]
+            for a in alerts:
+                lines.append(f"- [{a['severity'].upper()}] {a['title']} ({a['status']})")
+            sections.append("\n".join(lines))
+
+        # 3. Pattern detection — recurring issues
+        pq = supabase.table("wa_alerts").select("category, title").order("created_at", desc=True).limit(50)
+        if project_id:
+            pq = pq.eq("project_id", project_id)
+        all_alerts = pq.execute().data or []
+
+        if all_alerts:
+            # Count by category
+            cat_counts = {}
+            for a in all_alerts:
+                cat = a["category"]
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+            recurring = {c: n for c, n in cat_counts.items() if n >= 2}
+            if recurring:
+                lines = ["\nRECURRING PATTERNS (pay extra attention to these):"]
+                for cat, count in sorted(recurring.items(), key=lambda x: -x[1]):
+                    lines.append(f"- {cat}: flagged {count} times — this is a repeat issue")
+                sections.append("\n".join(lines))
+
+        # 4. Recent photo analysis summaries — what's been seen before
+        mq = supabase.table("wa_media_analysis").select("tags, analysis").order("created_at", desc=True).limit(5)
+        if project_id:
+            mq = mq.eq("project_id", project_id)
+        recent_photos = mq.execute().data or []
+
+        if recent_photos:
+            all_tags = {}
+            for p in recent_photos:
+                for t in (p.get("tags") or []):
+                    all_tags[t] = all_tags.get(t, 0) + 1
+            if all_tags:
+                lines = ["\nRECENT INSPECTION TRENDS (from last " + str(len(recent_photos)) + " photos):"]
+                for tag, count in sorted(all_tags.items(), key=lambda x: -x[1]):
+                    lines.append(f"- {tag}: observed in {count}/{len(recent_photos)} inspections")
+                sections.append("\n".join(lines))
+
+    except Exception as e:
+        print(f"Error building memory context: {e}")
+
+    if not sections:
+        return ""
+
+    return "\n\n".join(sections) + "\n\nUse this accumulated knowledge to inform your analysis. Compare against past observations. Flag if something is getting worse or is a new issue not seen before."
+
+
 # --- Background Processing ---
 
 def process_in_background(message_id, incoming_msg, media_urls, media_types, project_id, sender, sender_name, group_id, group_name, is_group):
     """Heavy processing: image analysis, knowledge extraction, alerts — runs in background thread."""
     try:
+        # Build memory context from accumulated knowledge
+        memory = build_memory_context(project_id)
+        enriched_system = SYSTEM_PROMPT
+        if memory:
+            enriched_system = SYSTEM_PROMPT + "\n\n" + memory
+            print(f"[BG] Memory context: {len(memory)} chars injected")
+
         image_analyses = []
 
-        # Analyze images with Claude Vision
+        # Analyze images with Claude Vision — now with accumulated knowledge
         for i, url in enumerate(media_urls):
             if not media_types[i].startswith("image/"):
                 continue
             try:
                 b64_data, detected_type = fetch_image_as_base64(url)
-                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg)
+                analysis = analyze_image_vision(b64_data, detected_type, incoming_msg, system_prompt=enriched_system)
                 image_analyses.append(analysis)
 
                 if message_id:
@@ -402,11 +501,12 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
             except Exception as e:
                 print(f"[BG] Image analysis failed for {url}: {e}")
 
-        # Extract knowledge + detect alerts (text-only to save tokens)
+        # Extract knowledge + detect alerts (with memory for pattern awareness)
         alerts = []
         if message_id and (incoming_msg or image_analyses):
             alerts = extract_and_store_knowledge(
                 message_id, incoming_msg, image_analyses, project_id, sender_name, group_name,
+                memory=memory,
             )
 
         # Dispatch alerts
@@ -427,14 +527,14 @@ def process_in_background(message_id, incoming_msg, media_urls, media_types, pro
 
 # --- Async Reply (via Twilio API, not TwiML) ---
 
-def send_reply_async(message_id, incoming_msg, sender, image_analyses=None):
+def send_reply_async(message_id, incoming_msg, sender, image_analyses=None, enriched_system=None):
     """Send reply via Twilio API. Reuses Vision analysis for images (no extra API call)."""
     try:
         if image_analyses:
             # Reuse the Vision analysis as the reply — no extra Claude call
             reply = "\n\n".join(image_analyses)
         elif incoming_msg:
-            # Text-only: need a Claude call
+            # Text-only: need a Claude call with memory-enriched system prompt
             if sender not in conversations:
                 conversations[sender] = []
 
@@ -446,7 +546,7 @@ def send_reply_async(message_id, incoming_msg, sender, image_analyses=None):
             response = claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
+                system=enriched_system or SYSTEM_PROMPT,
                 messages=conversations[sender],
             )
             reply = response.content[0].text
@@ -531,7 +631,7 @@ def process_all_in_background(form_data):
         # Reply if needed
         should_reply = not is_group or is_bot_tagged(incoming_msg)
         if should_reply:
-            send_reply_async(message_id, incoming_msg, sender, image_analyses=image_analyses or None)
+            send_reply_async(message_id, incoming_msg, sender, image_analyses=image_analyses or None, enriched_system=enriched_system)
 
     except Exception as e:
         print(f"[BG] Error: {e}")
