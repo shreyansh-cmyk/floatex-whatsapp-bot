@@ -465,6 +465,38 @@ def build_memory_context(project_id):
                     lines.append(f"- {tag}: observed in {count}/{len(recent_photos)} inspections")
                 sections.append("\n".join(lines))
 
+        # 5. Document knowledge — specs, quantities, vendors from uploaded docs
+        dq = supabase.table("doc_knowledge").select("doc_no, summary, category, specs, quantities, vendors, decisions").eq("processing_status", "processed").order("created_at", desc=True).limit(15)
+        if project_id:
+            dq = dq.eq("project_id", project_id)
+        doc_knowledge = dq.execute().data or []
+
+        if doc_knowledge:
+            lines = ["\nDOCUMENT KNOWLEDGE (extracted from uploaded project documents):"]
+            for dk in doc_knowledge:
+                lines.append(f"\n[{dk['doc_no']}] ({dk['category']})")
+                if dk.get("summary"):
+                    lines.append(f"  Summary: {dk['summary'][:150]}")
+                specs = dk.get("specs") or []
+                if isinstance(specs, str):
+                    try: specs = json.loads(specs)
+                    except: specs = []
+                for s in specs[:5]:
+                    lines.append(f"  - {s.get('param','')}: {s.get('value','')} {s.get('unit','')}")
+                vendors = dk.get("vendors") or []
+                if isinstance(vendors, str):
+                    try: vendors = json.loads(vendors)
+                    except: vendors = []
+                for v in vendors[:3]:
+                    lines.append(f"  - Vendor: {v.get('name','')} — {v.get('item','')} {v.get('price','')}")
+                decisions = dk.get("decisions") or []
+                if isinstance(decisions, str):
+                    try: decisions = json.loads(decisions)
+                    except: decisions = []
+                for d in decisions[:2]:
+                    lines.append(f"  - Decision: {d.get('decision','')}")
+            sections.append("\n".join(lines))
+
     except Exception as e:
         print(f"Error building memory context: {e}")
 
