@@ -936,7 +936,7 @@ def process_all_documents():
         for i, f in enumerate(unprocessed):
             print(f"[DOC] Batch {i+1}/{len(unprocessed)}: {f['filename']}")
             process_document_file(f["id"], f["document_id"], f["filename"], f["file_url"])
-            time.sleep(60)  # 1 doc per minute — safe for 10k tokens/min limit
+            time.sleep(90)  # 1 doc per 90s — PDFs can be large, 10k tokens/min limit
 
     threading.Thread(target=process_batch, daemon=True).start()
 
