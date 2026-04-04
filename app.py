@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, send_file
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from supabase import create_client
@@ -1045,6 +1045,49 @@ def list_executions(skill_slug):
         return {"error": "Skill not found"}, 404
     result = supabase.table("skill_executions").select("*").eq("skill_id", skill.data["id"]).order("created_at", desc=True).limit(20).execute()
     return {"executions": result.data or []}, 200
+
+
+@app.route("/api/generate-doc/<template_slug>", methods=["POST"])
+def generate_document(template_slug):
+    """Generate a .docx document from a template."""
+    from doc_templates import TEMPLATES
+
+    if template_slug not in TEMPLATES:
+        return {"error": f"Template '{template_slug}' not found. Available: {list(TEMPLATES.keys())}"}, 404
+
+    data = request.get_json(silent=True) or {}
+    project_id = data.get("project_id")
+
+    if not project_id:
+        return {"error": "project_id required"}, 400
+
+    # Fetch project data
+    proj_result = supabase.table("projects").select("*").eq("id", project_id).single().execute()
+    if not proj_result.data:
+        return {"error": f"Project '{project_id}' not found"}, 404
+
+    project = proj_result.data
+    template = TEMPLATES[template_slug]
+
+    try:
+        buffer, doc_no = template["generator"](project)
+        filename = template["filename_pattern"].format(pid=project_id)
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=filename,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+@app.route("/api/templates", methods=["GET"])
+def list_templates():
+    """List available document templates."""
+    from doc_templates import TEMPLATES
+    return {"templates": [{"slug": k, "title": v["title"]} for k, v in TEMPLATES.items()]}, 200
 
 
 @app.route("/", methods=["GET"])
