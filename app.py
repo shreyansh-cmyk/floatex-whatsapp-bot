@@ -766,18 +766,16 @@ def process_document_file(file_id, document_id, filename, file_url):
         }).execute()
         dk_id = dk_result.data[0]["id"] if dk_result.data else None
 
-        # Fetch file from Supabase storage via signed URL
-        try:
-            signed_result = supabase.storage.from_("portal-files").create_signed_url(file_url, 300)
-        except Exception as storage_err:
-            raise Exception(f"File not found in storage: {file_url} — {storage_err}")
-
-        # Extract signed URL from result
-        signed_url = None
-        if isinstance(signed_result, dict):
-            signed_url = signed_result.get("signedURL") or signed_result.get("signedUrl") or signed_result.get("signed_url")
-        if not signed_url:
-            raise Exception(f"Could not get signed URL for {file_url}")
+        # Fetch file from Supabase storage via REST API (bypass client quirks)
+        sign_response = httpx.post(
+            f"{SUPABASE_URL}/storage/v1/object/sign/portal-files/{file_url}",
+            headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"},
+            json={"expiresIn": 300},
+            timeout=15,
+        )
+        if sign_response.status_code != 200:
+            raise Exception(f"File not found in storage: {file_url} (HTTP {sign_response.status_code})")
+        signed_url = SUPABASE_URL + "/storage/v1" + sign_response.json().get("signedURL", "")
 
         dl_response = httpx.get(signed_url, follow_redirects=True, timeout=60)
         if dl_response.status_code != 200:
