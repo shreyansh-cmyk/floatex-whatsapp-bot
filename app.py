@@ -746,10 +746,13 @@ def process_document_file(file_id, document_id, filename, file_url):
     """Fetch a document from Supabase storage, extract text, analyze with Claude."""
     try:
         print(f"[DOC] Processing: {filename} (file_id: {file_id})")
+        dk_id = None
 
         # Get document metadata
-        doc_result = supabase.table("documents").select("project_id, doc_no, doc_type, title, section, package").eq("id", document_id).single().execute()
+        doc_result = supabase.table("documents").select("project_id, doc_no, doc_type, title, section, package").eq("id", document_id).maybe_single().execute()
         doc = doc_result.data if doc_result.data else {}
+        if not doc:
+            raise Exception(f"Document {document_id} not found in DB")
         project_id = doc.get("project_id")
         doc_no = doc.get("doc_no", "")
         doc_type = doc.get("doc_type", "")
@@ -871,7 +874,9 @@ def process_document_file(file_id, document_id, filename, file_url):
         print(f"[DOC] Done: {doc_no} — {data.get('category', '?')} — {len(data.get('specs', []))} specs, {len(data.get('quantities', []))} quantities")
 
     except Exception as e:
+        import traceback
         print(f"[DOC] Error processing {filename}: {e}")
+        traceback.print_exc()
         if dk_id:
             supabase.table("doc_knowledge").update({
                 "processing_status": "failed",
