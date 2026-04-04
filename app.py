@@ -37,56 +37,17 @@ conversations = {}
 
 # --- System Prompts ---
 
-SYSTEM_PROMPT = """You are the official AI assistant for Floatex Solar Private Limited (CIN: U28100DL2019PTC352379), India's leading floating solar PV technology company with ~75% domestic market share and 1+ GW delivered capacity.
+SYSTEM_PROMPT = """You are the AI assistant for Floatex Solar, India's leading floating solar company (~75% market share, 1GW+ delivered). Clients: L&T, NTPC, GAIL, Sterling Wilson.
 
-COMPANY OVERVIEW:
-- Floatex operates as a technology/IP licensor and EPC specialist for floating solar
-- Major clients: L&T, Tata Power, NTPC, Sterling Wilson
-- International expansion: Middle East, Africa, APAC, RAK/Dubai entity
+WHEN RECEIVING PHOTOS: Analyze for progress, safety, material condition, workmanship. Flag issues. Be concise — bullet points.
 
-ACTIVE PROJECTS:
-1. P014 Tilaiya 155MW (GVREL): 42 arrays, 4,244 anchor points, 210,975m total mooring rope. UTM Zone 45N. Four anchor block types (3.77, 2.76, 3.53, 2.59 MT). Case 1 high current (1.32 m/s) for arrays B12, B24, B38.
-2. P013 Getalsud 100MW (L&T): 14 arrays (B01-B14), 2,576 anchors, 166,359.5m mooring rope.
-3. P016 GAIL-PPL 17.5MW: Active project.
-4. ONGC Hazira 10MW: Total bid Rs 39.5 crores. Sludge removal 487,500 m3 dominates civil costs.
-5. DVC Mejia 14MW: Active project.
-6. GRIDCO 225MW Upper Indravati (Odisha): Consortium with Jakson Green (Floatex 26% / Jakson 74%). Floatex pricing Rs 76 lakhs/MW DC.
+WHEN RECEIVING DPR: Extract date, counts, array status. Flag any zero-progress days.
 
-KEY ENGINEERING DATA:
-- Aisle Float buoyancy: 74 kg
-- Hardware multipliers: modules x2 (clamps), x2.67 (bolts), x4.67 (washers)
-- Mooring formula P014: rope length = 3.23 x WD + 0.35
-- Mooring formula P013: rope length = sqrt(HD squared + WD squared)
-- Target mooring angle: 17.8-18.2 degrees (P014), 15-18 degrees (P013)
-- IFP platforms: Ferrocement barge design, GWM is external marine engineering consultant
-- Destructive test data: first crack at 8T, ultimate failure at 28T
-
-MANUFACTURING:
-- Raipur facility: 15+ machines producing floats and accessories
-- Production achievement improved from ~73% (early 2025) to ~91% (late 2025)
-
-WHEN RECEIVING A DAILY PROGRESS REPORT (DPR):
-- Extract: date, modules installed today, total modules installed, MW completed, percent complete
-- List array-by-array status (launching done / towing done)
-- Flag any in-progress arrays
-- Note damage count, manpower deployed
-- Summarize tomorrow plan
-- Keep response concise and structured
-
-SITE INSPECTION (when receiving photos):
-- Analyze the image for: structural integrity, safety hazards, installation progress, material condition, workmanship quality
-- For floating solar: check float alignment, mooring lines, panel orientation, cable routing, water conditions
-- Flag any safety concerns (missing PPE, exposed wiring, unstable structures)
-- Note weather/environmental conditions visible in the photo
-- If multiple images are sent, analyze each and provide a combined report
-- Compare against known project specs when possible
-
-RESPONSE STYLE:
-- Be concise - this is WhatsApp, keep replies under 300 words unless more detail is requested
-- Use emojis sparingly for status indicators
-- For calculations, show the formula and working
-- For project queries, reference the specific project by name
-- Always be professional and helpful to the site and engineering team
+RESPONSE RULES:
+- This is WhatsApp. Keep replies under 200 words.
+- Use bullet points, not paragraphs.
+- Reference project-specific data from the context provided.
+- Flag safety concerns prominently.
 """
 
 EXTRACTION_PROMPT = """Analyze this WhatsApp message (and any images) from a Floatex Solar group chat.
@@ -199,10 +160,10 @@ def store_message(sender, sender_name, group_id, group_name, body, num_media, me
 
 def analyze_image_vision(b64_data, media_type, caption="", system_prompt=None):
     """Send image to Claude Vision and return analysis text."""
-    prompt = caption or "Analyze this site photo from a floating solar project. Identify progress, issues, safety concerns, material conditions, and any notable observations."
+    prompt = caption or "Analyze this site photo. Focus on: progress, safety issues, material condition. Be concise — bullet points, under 200 words."
     response = claude.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1024,
+        max_tokens=600,
         system=system_prompt or SYSTEM_PROMPT,
         messages=[{
             "role": "user",
@@ -264,8 +225,8 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
 
     try:
         response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
             system=extraction_system,
             messages=[{"role": "user", "content": context}],
         )
@@ -396,121 +357,56 @@ def send_group_alert(alert, group_sender):
 
 # --- Knowledge Retrieval (Compounding Intelligence) ---
 
+MAX_MEMORY_CHARS = 1500  # Hard cap on memory context to control token usage
+
 def build_memory_context(project_id):
-    """Fetch accumulated knowledge from Supabase and build a context string for Claude."""
-    sections = []
+    """Fetch accumulated knowledge — optimized for minimal tokens."""
+    lines = []
 
     try:
-        # 1. Recent knowledge for this project (or all if no project)
-        kq = supabase.table("wa_knowledge").select("category, fact, confidence, extracted_at").eq("is_current", True).order("extracted_at", desc=True).limit(30)
+        # Single batch: fetch key data in parallel via Promise-style
+        # 1. Top 10 facts + 5 open alerts + 5 doc summaries — 3 queries instead of 5
+        kq = supabase.table("wa_knowledge").select("category, fact").eq("is_current", True).order("extracted_at", desc=True).limit(10)
         if project_id:
             kq = kq.eq("project_id", project_id)
         knowledge = kq.execute().data or []
 
-        if knowledge:
-            # Group by category
-            by_cat = {}
-            for k in knowledge:
-                cat = k["category"]
-                if cat not in by_cat:
-                    by_cat[cat] = []
-                by_cat[cat].append(k["fact"])
-
-            lines = ["ACCUMULATED KNOWLEDGE FROM PAST OBSERVATIONS:"]
-            for cat, facts in by_cat.items():
-                lines.append(f"\n[{cat.upper()}]")
-                for f in facts[:5]:  # Max 5 per category to limit tokens
-                    lines.append(f"- {f}")
-            sections.append("\n".join(lines))
-
-        # 2. Recent open alerts — so Claude knows what's already flagged
-        aq = supabase.table("wa_alerts").select("severity, category, title, status").in_("status", ["new", "acknowledged"]).order("created_at", desc=True).limit(10)
+        aq = supabase.table("wa_alerts").select("severity, title").in_("status", ["new", "acknowledged"]).order("created_at", desc=True).limit(5)
         if project_id:
             aq = aq.eq("project_id", project_id)
         alerts = aq.execute().data or []
 
-        if alerts:
-            lines = ["\nCURRENTLY OPEN ALERTS (already flagged, don't duplicate):"]
-            for a in alerts:
-                lines.append(f"- [{a['severity'].upper()}] {a['title']} ({a['status']})")
-            sections.append("\n".join(lines))
-
-        # 3. Pattern detection — recurring issues
-        pq = supabase.table("wa_alerts").select("category, title").order("created_at", desc=True).limit(50)
-        if project_id:
-            pq = pq.eq("project_id", project_id)
-        all_alerts = pq.execute().data or []
-
-        if all_alerts:
-            # Count by category
-            cat_counts = {}
-            for a in all_alerts:
-                cat = a["category"]
-                cat_counts[cat] = cat_counts.get(cat, 0) + 1
-
-            recurring = {c: n for c, n in cat_counts.items() if n >= 2}
-            if recurring:
-                lines = ["\nRECURRING PATTERNS (pay extra attention to these):"]
-                for cat, count in sorted(recurring.items(), key=lambda x: -x[1]):
-                    lines.append(f"- {cat}: flagged {count} times — this is a repeat issue")
-                sections.append("\n".join(lines))
-
-        # 4. Recent photo analysis summaries — what's been seen before
-        mq = supabase.table("wa_media_analysis").select("tags, analysis").order("created_at", desc=True).limit(5)
-        if project_id:
-            mq = mq.eq("project_id", project_id)
-        recent_photos = mq.execute().data or []
-
-        if recent_photos:
-            all_tags = {}
-            for p in recent_photos:
-                for t in (p.get("tags") or []):
-                    all_tags[t] = all_tags.get(t, 0) + 1
-            if all_tags:
-                lines = ["\nRECENT INSPECTION TRENDS (from last " + str(len(recent_photos)) + " photos):"]
-                for tag, count in sorted(all_tags.items(), key=lambda x: -x[1]):
-                    lines.append(f"- {tag}: observed in {count}/{len(recent_photos)} inspections")
-                sections.append("\n".join(lines))
-
-        # 5. Document knowledge — specs, quantities, vendors from uploaded docs
-        dq = supabase.table("doc_knowledge").select("doc_no, summary, category, specs, quantities, vendors, decisions").eq("processing_status", "processed").order("created_at", desc=True).limit(15)
+        dq = supabase.table("doc_knowledge").select("doc_no, summary").eq("processing_status", "processed").order("created_at", desc=True).limit(8)
         if project_id:
             dq = dq.eq("project_id", project_id)
-        doc_knowledge = dq.execute().data or []
+        docs = dq.execute().data or []
 
-        if doc_knowledge:
-            lines = ["\nDOCUMENT KNOWLEDGE (extracted from uploaded project documents):"]
-            for dk in doc_knowledge:
-                lines.append(f"\n[{dk['doc_no']}] ({dk['category']})")
-                if dk.get("summary"):
-                    lines.append(f"  Summary: {dk['summary'][:150]}")
-                specs = dk.get("specs") or []
-                if isinstance(specs, str):
-                    try: specs = json.loads(specs)
-                    except: specs = []
-                for s in specs[:5]:
-                    lines.append(f"  - {s.get('param','')}: {s.get('value','')} {s.get('unit','')}")
-                vendors = dk.get("vendors") or []
-                if isinstance(vendors, str):
-                    try: vendors = json.loads(vendors)
-                    except: vendors = []
-                for v in vendors[:3]:
-                    lines.append(f"  - Vendor: {v.get('name','')} — {v.get('item','')} {v.get('price','')}")
-                decisions = dk.get("decisions") or []
-                if isinstance(decisions, str):
-                    try: decisions = json.loads(decisions)
-                    except: decisions = []
-                for d in decisions[:2]:
-                    lines.append(f"  - Decision: {d.get('decision','')}")
-            sections.append("\n".join(lines))
+        # Build compact context
+        if knowledge:
+            lines.append("KNOWN FACTS:")
+            for k in knowledge[:8]:
+                lines.append(f"- [{k['category']}] {k['fact'][:100]}")
+
+        if alerts:
+            lines.append("OPEN ALERTS (don't duplicate):")
+            for a in alerts:
+                lines.append(f"- [{a['severity']}] {a['title'][:80]}")
+
+        if docs:
+            lines.append("PROJECT DOCS:")
+            for d in docs:
+                lines.append(f"- {d['doc_no']}: {(d.get('summary') or '')[:80]}")
 
     except Exception as e:
-        print(f"Error building memory context: {e}")
+        print(f"Memory context error: {e}")
 
-    if not sections:
+    if not lines:
         return ""
 
-    return "\n\n".join(sections) + "\n\nUse this accumulated knowledge to inform your analysis. Compare against past observations. Flag if something is getting worse or is a new issue not seen before."
+    result = "\n".join(lines)
+    if len(result) > MAX_MEMORY_CHARS:
+        result = result[:MAX_MEMORY_CHARS] + "..."
+    return result
 
 
 # --- Background Processing ---
@@ -585,7 +481,7 @@ def send_reply_async(message_id, incoming_msg, sender, image_analyses=None, enri
 
             response = claude.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=1024,
+                max_tokens=500,
                 system=enriched_system or SYSTEM_PROMPT,
                 messages=conversations[sender],
             )
@@ -985,10 +881,14 @@ def run_skill(exec_id, skill, project_id, input_data):
     start = time.time()
 
     try:
-        # 1. Build system prompt: base skill + learned context
-        system = skill["base_prompt"]
+        # 1. Build system prompt: cap base skill at 10K chars to control tokens
+        base = skill["base_prompt"]
+        if len(base) > 10000:
+            base = base[:10000] + "\n\n[... skill content truncated for token efficiency ...]"
+        system = base
         if skill.get("learned_context"):
-            system += "\n\n--- LEARNED FROM RECENT DOCUMENTS ---\n" + skill["learned_context"]
+            learned = skill["learned_context"][:2000]
+            system += "\n\n--- LEARNED FROM RECENT DOCUMENTS ---\n" + learned
 
         # 2. Fetch project context from Supabase
         context_parts = []
@@ -1085,10 +985,10 @@ def run_skill(exec_id, skill, project_id, input_data):
 def check_skill_learning(skill, output_text, input_data, project_id):
     """After a skill runs, check if the output contains patterns worth learning."""
     try:
-        # Ask Claude to extract learnable patterns
+        # Ask Haiku to extract learnable patterns (cheaper, fast enough for this)
         response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=512,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
             system="You extract reusable patterns from skill execution outputs. Return JSON array of learnings, or empty array if nothing new.",
             messages=[{"role": "user", "content": f"Skill: {skill['slug']}\nInput: {json.dumps(input_data)[:500]}\nOutput excerpt: {output_text[:2000]}\n\nExtract any new reusable patterns (comment templates, formulas, vendor data, workflow steps) that should be remembered for next time. Return: [{{'type': 'comment_pattern|spec_update|formula|vendor_data|workflow_change', 'content': 'the learning'}}] or []"}],
         )
