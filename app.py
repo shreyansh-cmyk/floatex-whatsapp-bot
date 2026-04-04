@@ -767,22 +767,24 @@ def process_document_file(file_id, document_id, filename, file_url):
         dk_id = dk_result.data[0]["id"] if dk_result.data else None
 
         # Fetch file from Supabase storage via signed URL
-        signed_result = supabase.storage.from_("portal-files").create_signed_url(file_url, 300)
-        # Handle various return formats
+        try:
+            signed_result = supabase.storage.from_("portal-files").create_signed_url(file_url, 300)
+        except Exception as storage_err:
+            raise Exception(f"File not found in storage: {file_url} — {storage_err}")
+
+        # Extract signed URL from result
+        signed_url = None
         if isinstance(signed_result, dict):
             signed_url = signed_result.get("signedURL") or signed_result.get("signedUrl") or signed_result.get("signed_url")
-        elif hasattr(signed_result, 'signed_url'):
-            signed_url = signed_result.signed_url
-        else:
-            signed_url = str(signed_result) if signed_result else None
-        if not signed_url or signed_url == 'None':
-            raise Exception(f"Could not create signed URL for {file_url}: {signed_result}")
+        if not signed_url:
+            raise Exception(f"Could not get signed URL for {file_url}")
+
         dl_response = httpx.get(signed_url, follow_redirects=True, timeout=60)
         if dl_response.status_code != 200:
             raise Exception(f"Download failed: HTTP {dl_response.status_code}")
         file_bytes = dl_response.content
         if len(file_bytes) < 100:
-            raise Exception(f"File too small ({len(file_bytes)} bytes), likely download error")
+            raise Exception(f"File too small ({len(file_bytes)} bytes)")
 
         is_pdf = filename.lower().endswith(".pdf")
         is_image = any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"])
