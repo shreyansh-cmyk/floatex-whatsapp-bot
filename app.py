@@ -848,8 +848,16 @@ def process_document_file(file_id, document_id, filename, file_url):
         cross_insights = []
         if existing.data and data.get("specs"):
             for spec in data["specs"]:
+                if not isinstance(spec, dict):
+                    continue
                 for e in existing.data:
-                    for es in (e.get("specs") or []):
+                    e_specs = e.get("specs") or []
+                    if isinstance(e_specs, str):
+                        try: e_specs = json.loads(e_specs)
+                        except: e_specs = []
+                    for es in e_specs:
+                        if not isinstance(es, dict):
+                            continue
                         if es.get("param") == spec.get("param") and es.get("value") != spec.get("value"):
                             cross_insights.append(f"{spec['param']}: {doc_no} says {spec.get('value')}{spec.get('unit','')} vs {e['doc_no']} says {es.get('value')}{es.get('unit','')}")
 
