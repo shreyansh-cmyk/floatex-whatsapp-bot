@@ -1256,6 +1256,77 @@ RULES: Use null for missing fields. Do NOT guess. Convert DMS to decimal. Flag k
         return {"error": f"NIT parsing failed: {str(e)}"}, 500
 
 
+@app.route("/api/wa-message", methods=["POST", "OPTIONS"])
+def wa_message():
+    """Receive messages from Baileys WhatsApp bridge — process silently."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()
+    sender = data.get("sender", "")
+    sender_name = data.get("sender_name", "")
+    group_id = data.get("group_id")
+    group_name = data.get("group_name")
+    media_type = data.get("media_type")
+    media_base64 = data.get("media_base64")
+    message_id_ext = data.get("message_id", "")
+
+    if not text and not media_base64:
+        return {"status": "skipped", "reason": "empty"}, 200
+
+    try:
+        # Detect project
+        project_id = detect_project_id(text or "")
+
+        # Store message
+        message_id = store_message(
+            sender, sender_name, group_id, group_name,
+            text, 1 if media_base64 else 0,
+            [], [media_type] if media_type else [],
+            message_id_ext,
+        )
+
+        # Build memory context
+        memory = build_memory_context(project_id)
+        enriched_system = SYSTEM_PROMPT
+        if memory:
+            enriched_system = SYSTEM_PROMPT + "\n\n" + memory
+
+        # Analyze image if present
+        image_analyses = []
+        if media_base64 and media_type and media_type.startswith("image"):
+            try:
+                analysis = analyze_image_vision(media_base64, media_type, text, system_prompt=enriched_system)
+                image_analyses.append(analysis)
+                if message_id:
+                    store_media_analysis(message_id, "baileys://local", media_type, analysis, project_id)
+            except Exception as e:
+                print(f"[WA-BRIDGE] Image analysis failed: {e}")
+
+        # Extract knowledge (silent — no alerts sent)
+        if message_id and (text or image_analyses):
+            extract_and_store_knowledge(
+                message_id, text, image_analyses, project_id, sender_name, group_name,
+                memory=memory,
+            )
+
+        # Mark processed
+        if message_id:
+            supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
+
+        return {
+            "status": "ok",
+            "message_id": message_id,
+            "project_id": project_id,
+            "images_analyzed": len(image_analyses),
+        }, 200
+
+    except Exception as e:
+        print(f"[WA-BRIDGE] Error: {e}")
+        return {"error": str(e)}, 500
+
+
 @app.route("/", methods=["GET"])
 def health():
     return "Floatex Intelligence Platform — Bot + Docs + Skills", 200
