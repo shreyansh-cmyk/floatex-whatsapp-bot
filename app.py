@@ -1092,141 +1092,145 @@ def list_templates():
 
 @app.route("/api/parse-nit", methods=["POST", "OPTIONS"])
 def parse_nit():
-    """Parse NIT/tender document text or images and extract DBR-relevant fields using Claude."""
+    """Parse NIT/tender PDFs: pdfplumber for text, Claude Vision for scanned docs."""
     if request.method == "OPTIONS":
         return "", 204
 
+    import pdfplumber
+    import io
+
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "")
-    images = data.get("images", [])  # List of {filename, page, data (base64 jpeg)}
+    pdfs = data.get("pdfs", [])  # List of {filename, data (base64)}
+    text_override = data.get("text", "")  # Direct text input (for testing)
 
-    if (not text or len(text) < 100) and len(images) == 0:
-        return {"error": "No content provided. Upload tender PDF(s)."}, 400
+    if not pdfs and not text_override:
+        return {"error": "No PDFs provided."}, 400
 
-    NIT_EXTRACTION_PROMPT = """You are an expert floating solar PV engineer at Floatex Solar. You are reading NIT (Notice Inviting Tender) / tender documents for a floating solar project.
+    NIT_PROMPT = """You are an expert floating solar PV engineer at Floatex Solar reading NIT/tender documents.
 
-Extract ALL project-specific data fields that would go into a Design Basis Report (DBR). Return ONLY a JSON object with these fields (use null for fields not found):
+Extract ALL DBR-relevant fields. Return ONLY valid JSON (no markdown, no wrapper):
 
 {
-  "project_name": "Full project name",
-  "capacity_ac_mw": "AC capacity in MW (number)",
-  "capacity_dc_mwp": "DC capacity in MWp (number)",
-  "design_life": "Design life in years (number)",
-  "client_name": "Client short name (e.g. SECI, GVREL, GAIL)",
-  "client_full_name": "Full legal name of client/owner",
-  "epc_name": "EPC contractor name if mentioned",
-  "owner_water_body": "Owner of water body/land",
-  "owner_project": "Project owner",
-
-  "site_name": "Site/reservoir name",
-  "state": "State",
+  "project_name": "string or null",
+  "capacity_ac_mw": "number or null",
+  "capacity_dc_mwp": "number or null",
+  "design_life": "number or null",
+  "client_name": "short name or null",
+  "client_full_name": "full legal name or null",
+  "epc_name": "string or null",
+  "owner_water_body": "string or null",
+  "owner_project": "string or null",
+  "site_name": "string or null",
+  "state": "string or null",
   "country": "India",
-  "nearest_town": "Nearest town with distance",
-  "nearest_railway": "Nearest railway station with distance",
-  "nearest_airport": "Nearest airport with distance",
-  "latitude": "Latitude as decimal degrees (e.g. 24.3174)",
-  "longitude": "Longitude as decimal degrees (e.g. 85.5231)",
-
-  "frl": "Full Reservoir Level in meters (number only)",
-  "mddl": "Minimum Drawdown Level in meters (number only)",
-  "mwl": "Maximum Water Level in meters (number only)",
-  "seismic_zone": "Seismic zone (e.g. Zone II, Zone III)",
-  "max_depth_at_frl": "Maximum water depth at FRL in meters",
-  "min_depth_at_mddl": "Minimum water depth at MDDL in meters",
-
-  "vb": "Basic wind speed Vb in m/s (number only, from IS 875)",
-  "k1": "Probability factor k1 (number, IS 875 default 0.92 for 25yr, but NIT may override to 1.0)",
-  "k2": "Terrain factor k2 (number, IS 875 default 1.0, but NIT may override to 1.05)",
-  "k3": "Topography factor k3 (number, usually 1.0)",
-  "k4": "Cyclonic factor k4 (1.0 if >60km from coast, 1.15 if coastal)",
-  "nit_min_design_wind_pressure": "Minimum design wind pressure if NIT specifies (N/m², number only)",
-  "nit_anchor_wind_reduction": "Wind pressure reduction % for anchoring system (typically 20)",
-
-  "wave_height": "Significant wave height Hs in meters if available",
-  "wave_period": "Wave period in seconds if available",
-  "current_velocity": "Current velocity in m/s if available",
-
-  "module_manufacturer": "Module manufacturer if specified",
-  "module_wattage": "Module wattage in Wp (number only)",
-  "module_length": "Module length in mm (number only)",
-  "module_width": "Module width in mm (number only)",
-  "module_height": "Module height/thickness in mm (number only)",
-  "module_weight": "Module weight in kg (number only)",
-  "module_tilt": "Module tilt angle in degrees (number only)",
-
-  "inverter_type": "Inverter type: SCB, String Inverter, Central Inverter, or SMB",
-  "inverter_model": "Inverter model if specified",
-  "inverter_rating": "Inverter rating if specified",
-  "inverter_weight": "Inverter weight in kg if specified",
-  "inverter_dims": "Inverter dimensions if specified",
-
-  "nit_concrete_grade": "Concrete grade for offshore/anchor (M25, M30, or M35)",
-  "nit_hdg_micron": "HDG thickness in microns (80 or 110)",
-  "nit_corrosion_category": "Corrosion category (C2, C3, C4, or C5)",
-  "nit_handrail_material": "Handrail material grade (SS 304 or SS 316)",
-  "nit_weld_mesh_gsm": "Weld mesh GSM (80 or 120)",
-  "nit_expanded_metal_gsm": "Expanded metal GSM if specified",
-  "nit_fastener_material": "Fastener material (SS 304 or SS 316)",
-  "nit_clamp_material": "Clamp material (e.g. Aluminum, Al 6063-T6)",
-  "nit_clamp_coating": "Clamp coating if specified (e.g. AC25 per IS 1868)",
-
-  "ref_docs": [{"title": "Document title", "doc_no": "Document number if available"}],
-
-  "notes": ["Important observations, warnings, or special requirements to flag to the engineer"]
+  "nearest_town": "with distance or null",
+  "nearest_railway": "with distance or null",
+  "nearest_airport": "with distance or null",
+  "latitude": "decimal degrees or null",
+  "longitude": "decimal degrees or null",
+  "frl": "meters number or null",
+  "mddl": "meters number or null",
+  "mwl": "meters number or null",
+  "seismic_zone": "Zone II/III/IV/V or null",
+  "vb": "wind speed m/s number or null",
+  "k1": "number or null — CRITICAL: check if NIT overrides IS 875 default 0.92",
+  "k2": "number or null — CRITICAL: check if NIT overrides IS 875 default 1.0",
+  "k3": "number or null",
+  "k4": "number or null",
+  "nit_min_design_wind_pressure": "N/m² number or null",
+  "nit_anchor_wind_reduction": "% number or null",
+  "wave_height": "meters or null",
+  "current_velocity": "m/s or null",
+  "module_manufacturer": "string or null",
+  "module_wattage": "Wp number or null",
+  "module_length": "mm number or null",
+  "module_width": "mm number or null",
+  "module_height": "mm number or null",
+  "module_weight": "kg number or null",
+  "module_tilt": "degrees number or null",
+  "inverter_type": "SCB/String Inverter/Central Inverter or null",
+  "inverter_model": "string or null",
+  "inverter_rating": "string or null",
+  "inverter_weight": "kg or null",
+  "nit_concrete_grade": "M25/M30/M35 or null",
+  "nit_hdg_micron": "80/110 number or null",
+  "nit_corrosion_category": "C2/C3/C4/C5 or null",
+  "nit_handrail_material": "SS 304/SS 316 or null",
+  "nit_weld_mesh_gsm": "80/120 number or null",
+  "nit_fastener_material": "SS 304/SS 316 or null",
+  "nit_clamp_material": "string or null",
+  "nit_clamp_coating": "string or null",
+  "ref_docs": [{"title": "string", "doc_no": "string or null"}],
+  "notes": ["important observations for the engineer"]
 }
 
-CRITICAL RULES:
-1. For k1, k2, k3, k4: Look carefully for tender-specified MINIMUM values that OVERRIDE IS 875 defaults. Many NITs say "minimum k1 shall be 1.0" or "k2 shall not be less than 1.05". These overrides are CRITICAL for design safety.
-2. For material specs: Look for corrosion category, HDG requirements, SS grades (304 vs 316), concrete grades (M25 vs M30 for offshore).
-3. Return ONLY valid JSON. No markdown, no explanation, no ```json wrapper.
-4. Use null for fields not found — do NOT guess or hallucinate.
-5. Convert DMS coordinates to decimal degrees if needed.
-6. For ref_docs, extract all referenced documents/standards."""
+RULES: Use null for missing fields. Do NOT guess. Convert DMS to decimal. Flag k-factor overrides in notes."""
 
     try:
-        # Build message content — can be text, images, or both
+        all_text = text_override or ""
+        scanned_pdfs = []  # PDFs that need Vision
+        mode = "text"
+
+        # Step 1: Try pdfplumber text extraction on each PDF
+        for pdf_item in pdfs:
+            filename = pdf_item.get("filename", "unknown.pdf")
+            pdf_bytes = base64.b64decode(pdf_item["data"])
+
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    doc_text = ""
+                    for page in pdf.pages:
+                        t = page.extract_text()
+                        if t:
+                            doc_text += t + "\n"
+
+                    avg_chars = len(doc_text.strip()) / max(len(pdf.pages), 1)
+
+                    if avg_chars > 50:
+                        # Good text extraction
+                        all_text += f"\n\n--- {filename} ---\n\n{doc_text}"
+                    else:
+                        # Scanned PDF — needs Vision
+                        scanned_pdfs.append(pdf_item)
+            except Exception:
+                scanned_pdfs.append(pdf_item)
+
+        # Step 2: Build Claude request
         content_blocks = []
 
-        if text and len(text) > 100:
-            # Truncate text to ~80K chars
-            truncated = text[:80000] if len(text) > 80000 else text
+        if all_text.strip() and len(all_text.strip()) > 50:
             content_blocks.append({
                 "type": "text",
-                "text": f"NIT/tender document text:\n\n{truncated}"
+                "text": f"NIT/tender document text:\n\n{all_text[:80000]}"
             })
 
-        if images:
-            # Group images by filename for context
-            current_file = None
-            for img in images[:40]:  # Cap at 40 pages
-                if img.get("filename") != current_file:
-                    current_file = img.get("filename")
-                    content_blocks.append({
-                        "type": "text",
-                        "text": f"\n--- Pages from: {current_file} ---"
-                    })
+        if scanned_pdfs:
+            mode = "vision"
+            for pdf_item in scanned_pdfs[:5]:  # Cap at 5 PDFs for Vision
                 content_blocks.append({
-                    "type": "image",
+                    "type": "text",
+                    "text": f"\n--- Scanned PDF: {pdf_item.get('filename', 'document')} ---"
+                })
+                content_blocks.append({
+                    "type": "document",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": img["data"],
+                        "media_type": "application/pdf",
+                        "data": pdf_item["data"],
                     }
                 })
 
         if not content_blocks:
-            return {"error": "No content to parse."}, 400
+            return {"error": "No readable content found in uploaded PDFs."}, 400
 
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4000,
             messages=[{"role": "user", "content": content_blocks}],
-            system=NIT_EXTRACTION_PROMPT,
+            system=NIT_PROMPT,
         )
 
         result_text = response.content[0].text.strip()
-
-        # Clean up response — handle ```json wrapper
         if result_text.startswith("```"):
             result_text = re.sub(r'^```\w*\n?', '', result_text)
             result_text = re.sub(r'\n?```$', '', result_text)
@@ -1237,12 +1241,13 @@ CRITICAL RULES:
             "status": "ok",
             "fields": parsed,
             "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
-            "mode": "vision" if images else "text",
-            "pages_processed": len(images) if images else 0,
+            "mode": mode,
+            "scanned_count": len(scanned_pdfs),
+            "text_count": len(pdfs) - len(scanned_pdfs),
         }, 200
 
     except json.JSONDecodeError as e:
-        return {"error": f"Failed to parse Claude response as JSON: {str(e)}", "raw": result_text[:500]}, 500
+        return {"error": f"JSON parse error: {str(e)}", "raw": result_text[:500]}, 500
     except Exception as e:
         return {"error": f"NIT parsing failed: {str(e)}"}, 500
 
