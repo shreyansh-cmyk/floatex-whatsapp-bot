@@ -1090,6 +1090,163 @@ def list_templates():
     return {"templates": [{"slug": k, "title": v["title"]} for k, v in TEMPLATES.items()]}, 200
 
 
+@app.route("/api/parse-nit", methods=["POST", "OPTIONS"])
+def parse_nit():
+    """Parse NIT/tender document text or images and extract DBR-relevant fields using Claude."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    images = data.get("images", [])  # List of {filename, page, data (base64 jpeg)}
+
+    if (not text or len(text) < 100) and len(images) == 0:
+        return {"error": "No content provided. Upload tender PDF(s)."}, 400
+
+    NIT_EXTRACTION_PROMPT = """You are an expert floating solar PV engineer at Floatex Solar. You are reading NIT (Notice Inviting Tender) / tender documents for a floating solar project.
+
+Extract ALL project-specific data fields that would go into a Design Basis Report (DBR). Return ONLY a JSON object with these fields (use null for fields not found):
+
+{
+  "project_name": "Full project name",
+  "capacity_ac_mw": "AC capacity in MW (number)",
+  "capacity_dc_mwp": "DC capacity in MWp (number)",
+  "design_life": "Design life in years (number)",
+  "client_name": "Client short name (e.g. SECI, GVREL, GAIL)",
+  "client_full_name": "Full legal name of client/owner",
+  "epc_name": "EPC contractor name if mentioned",
+  "owner_water_body": "Owner of water body/land",
+  "owner_project": "Project owner",
+
+  "site_name": "Site/reservoir name",
+  "state": "State",
+  "country": "India",
+  "nearest_town": "Nearest town with distance",
+  "nearest_railway": "Nearest railway station with distance",
+  "nearest_airport": "Nearest airport with distance",
+  "latitude": "Latitude as decimal degrees (e.g. 24.3174)",
+  "longitude": "Longitude as decimal degrees (e.g. 85.5231)",
+
+  "frl": "Full Reservoir Level in meters (number only)",
+  "mddl": "Minimum Drawdown Level in meters (number only)",
+  "mwl": "Maximum Water Level in meters (number only)",
+  "seismic_zone": "Seismic zone (e.g. Zone II, Zone III)",
+  "max_depth_at_frl": "Maximum water depth at FRL in meters",
+  "min_depth_at_mddl": "Minimum water depth at MDDL in meters",
+
+  "vb": "Basic wind speed Vb in m/s (number only, from IS 875)",
+  "k1": "Probability factor k1 (number, IS 875 default 0.92 for 25yr, but NIT may override to 1.0)",
+  "k2": "Terrain factor k2 (number, IS 875 default 1.0, but NIT may override to 1.05)",
+  "k3": "Topography factor k3 (number, usually 1.0)",
+  "k4": "Cyclonic factor k4 (1.0 if >60km from coast, 1.15 if coastal)",
+  "nit_min_design_wind_pressure": "Minimum design wind pressure if NIT specifies (N/m², number only)",
+  "nit_anchor_wind_reduction": "Wind pressure reduction % for anchoring system (typically 20)",
+
+  "wave_height": "Significant wave height Hs in meters if available",
+  "wave_period": "Wave period in seconds if available",
+  "current_velocity": "Current velocity in m/s if available",
+
+  "module_manufacturer": "Module manufacturer if specified",
+  "module_wattage": "Module wattage in Wp (number only)",
+  "module_length": "Module length in mm (number only)",
+  "module_width": "Module width in mm (number only)",
+  "module_height": "Module height/thickness in mm (number only)",
+  "module_weight": "Module weight in kg (number only)",
+  "module_tilt": "Module tilt angle in degrees (number only)",
+
+  "inverter_type": "Inverter type: SCB, String Inverter, Central Inverter, or SMB",
+  "inverter_model": "Inverter model if specified",
+  "inverter_rating": "Inverter rating if specified",
+  "inverter_weight": "Inverter weight in kg if specified",
+  "inverter_dims": "Inverter dimensions if specified",
+
+  "nit_concrete_grade": "Concrete grade for offshore/anchor (M25, M30, or M35)",
+  "nit_hdg_micron": "HDG thickness in microns (80 or 110)",
+  "nit_corrosion_category": "Corrosion category (C2, C3, C4, or C5)",
+  "nit_handrail_material": "Handrail material grade (SS 304 or SS 316)",
+  "nit_weld_mesh_gsm": "Weld mesh GSM (80 or 120)",
+  "nit_expanded_metal_gsm": "Expanded metal GSM if specified",
+  "nit_fastener_material": "Fastener material (SS 304 or SS 316)",
+  "nit_clamp_material": "Clamp material (e.g. Aluminum, Al 6063-T6)",
+  "nit_clamp_coating": "Clamp coating if specified (e.g. AC25 per IS 1868)",
+
+  "ref_docs": [{"title": "Document title", "doc_no": "Document number if available"}],
+
+  "notes": ["Important observations, warnings, or special requirements to flag to the engineer"]
+}
+
+CRITICAL RULES:
+1. For k1, k2, k3, k4: Look carefully for tender-specified MINIMUM values that OVERRIDE IS 875 defaults. Many NITs say "minimum k1 shall be 1.0" or "k2 shall not be less than 1.05". These overrides are CRITICAL for design safety.
+2. For material specs: Look for corrosion category, HDG requirements, SS grades (304 vs 316), concrete grades (M25 vs M30 for offshore).
+3. Return ONLY valid JSON. No markdown, no explanation, no ```json wrapper.
+4. Use null for fields not found — do NOT guess or hallucinate.
+5. Convert DMS coordinates to decimal degrees if needed.
+6. For ref_docs, extract all referenced documents/standards."""
+
+    try:
+        # Build message content — can be text, images, or both
+        content_blocks = []
+
+        if text and len(text) > 100:
+            # Truncate text to ~80K chars
+            truncated = text[:80000] if len(text) > 80000 else text
+            content_blocks.append({
+                "type": "text",
+                "text": f"NIT/tender document text:\n\n{truncated}"
+            })
+
+        if images:
+            # Group images by filename for context
+            current_file = None
+            for img in images[:40]:  # Cap at 40 pages
+                if img.get("filename") != current_file:
+                    current_file = img.get("filename")
+                    content_blocks.append({
+                        "type": "text",
+                        "text": f"\n--- Pages from: {current_file} ---"
+                    })
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img["data"],
+                    }
+                })
+
+        if not content_blocks:
+            return {"error": "No content to parse."}, 400
+
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": content_blocks}],
+            system=NIT_EXTRACTION_PROMPT,
+        )
+
+        result_text = response.content[0].text.strip()
+
+        # Clean up response — handle ```json wrapper
+        if result_text.startswith("```"):
+            result_text = re.sub(r'^```\w*\n?', '', result_text)
+            result_text = re.sub(r'\n?```$', '', result_text)
+
+        parsed = json.loads(result_text)
+
+        return {
+            "status": "ok",
+            "fields": parsed,
+            "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
+            "mode": "vision" if images else "text",
+            "pages_processed": len(images) if images else 0,
+        }, 200
+
+    except json.JSONDecodeError as e:
+        return {"error": f"Failed to parse Claude response as JSON: {str(e)}", "raw": result_text[:500]}, 500
+    except Exception as e:
+        return {"error": f"NIT parsing failed: {str(e)}"}, 500
+
+
 @app.route("/", methods=["GET"])
 def health():
     return "Floatex Intelligence Platform — Bot + Docs + Skills", 200
