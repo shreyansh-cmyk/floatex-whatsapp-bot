@@ -562,20 +562,24 @@ def process_all_in_background(form_data):
                 memory=memory,
             )
 
-        for alert in alerts:
-            send_proactive_alert(alert)
-            if is_group:
-                send_group_alert(alert, sender)
+        # Silent mode — store alerts in DB but don't send WhatsApp messages
+        # Alerts visible on portal WhatsApp Intelligence dashboard
+        # for alert in alerts:
+        #     send_proactive_alert(alert)
+        #     if is_group:
+        #         send_group_alert(alert, sender)
 
         if message_id:
             supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
 
         print(f"[BG] Processed: {len(image_analyses)} images, {len(alerts)} alerts")
 
-        # Reply if needed
-        should_reply = not is_group or is_bot_tagged(incoming_msg)
-        if should_reply:
-            send_reply_async(message_id, incoming_msg, sender, image_analyses=image_analyses or None, enriched_system=enriched_system)
+        # Silent mode — observe and build knowledge, never reply
+        # Bot sits in groups, extracts knowledge, stores alerts, but does not send messages
+        # To re-enable replies, uncomment the block below:
+        # should_reply = not is_group or is_bot_tagged(incoming_msg)
+        # if should_reply:
+        #     send_reply_async(message_id, incoming_msg, sender, image_analyses=image_analyses or None, enriched_system=enriched_system)
 
     except Exception as e:
         print(f"[BG] Error: {e}")
