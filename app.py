@@ -35,6 +35,19 @@ BOT_NUMBER = os.environ.get("BOT_NUMBER", "")  # e.g. whatsapp:+14155238886
 # In-memory conversation history (per sender, for contextual replies)
 conversations = {}
 
+# --- Image dedup + batch queue ---
+import hashlib
+import time as _time
+
+# Track recent image hashes to skip duplicates (same image sent multiple times)
+_recent_image_hashes = {}  # hash -> timestamp
+_IMAGE_DEDUP_WINDOW = 300  # 5 minutes — skip if same image seen within this window
+
+# Batch queue for image processing
+_image_queue = []  # list of {message_id, media_base64, media_type, text, project_id, sender_name, group_name, group_id, queued_at}
+_BATCH_INTERVAL = 120  # Process queued images every 2 minutes
+_batch_timer = None
+
 # --- System Prompts ---
 
 SYSTEM_PROMPT = """You are the AI assistant for Floatex Solar, India's leading floating solar company (~75% market share, 1GW+ delivered). Clients: L&T, NTPC, GAIL, Sterling Wilson.
@@ -85,6 +98,44 @@ Rules:
 
 
 # --- Helpers ---
+
+def is_duplicate_image(media_base64):
+    """Check if this image was already processed recently."""
+    # Hash first 10KB of image data (fast, catches exact dupes and near-dupes from same sender)
+    sample = media_base64[:10000] if len(media_base64) > 10000 else media_base64
+    img_hash = hashlib.md5(sample.encode()).hexdigest()
+    now = _time.time()
+
+    # Clean old entries
+    expired = [h for h, t in _recent_image_hashes.items() if now - t > _IMAGE_DEDUP_WINDOW]
+    for h in expired:
+        del _recent_image_hashes[h]
+
+    if img_hash in _recent_image_hashes:
+        return True
+    _recent_image_hashes[img_hash] = now
+    return False
+
+
+def save_image_to_storage(media_base64, media_type, message_id, project_id):
+    """Save image to Supabase Storage and return the file path."""
+    try:
+        ext = media_type.split("/")[-1] if media_type else "jpg"
+        if ext == "jpeg":
+            ext = "jpg"
+        file_path = f"wa-photos/{project_id or 'unknown'}/{message_id}.{ext}"
+        file_bytes = base64.b64decode(media_base64)
+
+        supabase.storage.from_("portal-files").upload(
+            file_path, file_bytes,
+            {"content-type": media_type or "image/jpeg", "upsert": "true"},
+        )
+        print(f"[STORAGE] Saved image: {file_path} ({len(file_bytes)} bytes)")
+        return file_path
+    except Exception as e:
+        print(f"[STORAGE] Failed to save image: {e}")
+        return None
+
 
 def fetch_image_as_base64(media_url):
     """Fetch an image from Twilio and return (base64_data, media_type)."""
@@ -1256,9 +1307,87 @@ RULES: Use null for missing fields. Do NOT guess. Convert DMS to decimal. Flag k
         return {"error": f"NIT parsing failed: {str(e)}"}, 500
 
 
+def process_image_batch():
+    """Process queued images in batch — runs every BATCH_INTERVAL seconds."""
+    global _batch_timer, _image_queue
+
+    if not _image_queue:
+        _batch_timer = threading.Timer(_BATCH_INTERVAL, process_image_batch)
+        _batch_timer.daemon = True
+        _batch_timer.start()
+        return
+
+    batch = _image_queue[:]
+    _image_queue = []
+    print(f"[BATCH] Processing {len(batch)} queued images...")
+
+    for item in batch:
+        try:
+            memory = build_memory_context(item["project_id"])
+            enriched_system = SYSTEM_PROMPT
+            if memory:
+                enriched_system = SYSTEM_PROMPT + "\n\n" + memory
+
+            # Save image to Supabase Storage
+            storage_path = save_image_to_storage(
+                item["media_base64"], item["media_type"],
+                item["message_id"], item["project_id"],
+            )
+            storage_url = f"portal-files/{storage_path}" if storage_path else "baileys://local"
+
+            # Analyze with Claude Vision
+            analysis = analyze_image_vision(
+                item["media_base64"], item["media_type"],
+                item["text"], system_prompt=enriched_system,
+            )
+
+            # Store analysis with actual storage URL
+            if item["message_id"]:
+                store_media_analysis(
+                    item["message_id"], storage_url,
+                    item["media_type"], analysis, item["project_id"],
+                )
+
+            # Extract knowledge
+            if item["message_id"]:
+                extract_and_store_knowledge(
+                    item["message_id"], item["text"], [analysis],
+                    item["project_id"], item["sender_name"], item["group_name"],
+                    memory=memory,
+                )
+
+            # Mark processed
+            if item["message_id"]:
+                supabase.table("whatsapp_messages").update({"processed": True}).eq("id", item["message_id"]).execute()
+
+            print(f"[BATCH] Done: msg {item['message_id']} from {item['sender_name']}")
+            _time.sleep(2)  # Small delay between images to avoid API rate limits
+
+        except Exception as e:
+            print(f"[BATCH] Error processing image: {e}")
+            if item.get("message_id"):
+                supabase.table("whatsapp_messages").update({"processed": True}).eq("id", item["message_id"]).execute()
+
+    # Schedule next batch
+    _batch_timer = threading.Timer(_BATCH_INTERVAL, process_image_batch)
+    _batch_timer.daemon = True
+    _batch_timer.start()
+
+
+# Start batch timer on app load
+def start_batch_timer():
+    global _batch_timer
+    _batch_timer = threading.Timer(_BATCH_INTERVAL, process_image_batch)
+    _batch_timer.daemon = True
+    _batch_timer.start()
+    print(f"[BATCH] Image batch processor started (every {_BATCH_INTERVAL}s)")
+
+start_batch_timer()
+
+
 @app.route("/api/wa-message", methods=["POST", "OPTIONS"])
 def wa_message():
-    """Receive messages from Baileys WhatsApp bridge — process silently."""
+    """Receive messages from WA bridge — process text immediately, queue images for batch."""
     if request.method == "OPTIONS":
         return "", 204
 
@@ -1275,6 +1404,13 @@ def wa_message():
     if not text and not media_base64:
         return {"status": "skipped", "reason": "empty"}, 200
 
+    has_image = media_base64 and media_type and media_type.startswith("image")
+
+    # Check for duplicate images
+    if has_image and is_duplicate_image(media_base64):
+        print(f"[DEDUP] Skipping duplicate image from {sender_name}")
+        return {"status": "skipped", "reason": "duplicate_image"}, 200
+
     try:
         # Detect project
         project_id = detect_project_id(text or "")
@@ -1282,45 +1418,51 @@ def wa_message():
         # Store message
         message_id = store_message(
             sender, sender_name, group_id, group_name,
-            text, 1 if media_base64 else 0,
+            text, 1 if has_image else 0,
             [], [media_type] if media_type else [],
             message_id_ext,
         )
 
-        # Build memory context
-        memory = build_memory_context(project_id)
-        enriched_system = SYSTEM_PROMPT
-        if memory:
-            enriched_system = SYSTEM_PROMPT + "\n\n" + memory
+        if has_image:
+            # Queue image for batch processing (saves tokens by batching)
+            _image_queue.append({
+                "message_id": message_id,
+                "media_base64": media_base64,
+                "media_type": media_type,
+                "text": text,
+                "project_id": project_id,
+                "sender_name": sender_name,
+                "group_name": group_name,
+                "group_id": group_id,
+                "queued_at": _time.time(),
+            })
+            print(f"[QUEUE] Image queued from {sender_name} ({len(_image_queue)} in queue)")
 
-        # Analyze image if present
-        image_analyses = []
-        if media_base64 and media_type and media_type.startswith("image"):
-            try:
-                analysis = analyze_image_vision(media_base64, media_type, text, system_prompt=enriched_system)
-                image_analyses.append(analysis)
-                if message_id:
-                    store_media_analysis(message_id, "baileys://local", media_type, analysis, project_id)
-            except Exception as e:
-                print(f"[WA-BRIDGE] Image analysis failed: {e}")
+            return {
+                "status": "queued",
+                "message_id": message_id,
+                "project_id": project_id,
+                "queue_size": len(_image_queue),
+            }, 200
 
-        # Extract knowledge (silent — no alerts sent)
-        if message_id and (text or image_analyses):
-            extract_and_store_knowledge(
-                message_id, text, image_analyses, project_id, sender_name, group_name,
-                memory=memory,
-            )
+        else:
+            # Text-only: process immediately (cheap — just Haiku)
+            if message_id and text:
+                memory = build_memory_context(project_id)
+                extract_and_store_knowledge(
+                    message_id, text, [], project_id, sender_name, group_name,
+                    memory=memory,
+                )
 
-        # Mark processed
-        if message_id:
-            supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
+            if message_id:
+                supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
 
-        return {
-            "status": "ok",
-            "message_id": message_id,
-            "project_id": project_id,
-            "images_analyzed": len(image_analyses),
-        }, 200
+            return {
+                "status": "ok",
+                "message_id": message_id,
+                "project_id": project_id,
+                "images_analyzed": 0,
+            }, 200
 
     except Exception as e:
         print(f"[WA-BRIDGE] Error: {e}")
