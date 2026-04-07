@@ -424,27 +424,143 @@ def generate_daily_summary(project_id=None, group_name=None):
         return None
 
 
+def detect_project_from_group(group_name):
+    """Extract project ID from group name like 'P013- Block Dropping Getalsud'."""
+    if not group_name:
+        return None
+    # Try P0XX pattern in group name
+    match = re.search(r'\b(P\d{3})\b', group_name, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    # Try known project keywords
+    keywords = {
+        "tilaiya": "P014", "155mw": "P014", "155 mw": "P014", "dvc": "P014",
+        "getalsud": "P013", "100mw": "P013",
+        "gail": "P016", "pata": "P016",
+        "hazira": "P017", "ongc": "P017",
+    }
+    lower = group_name.lower()
+    for kw, pid in keywords.items():
+        if kw in lower:
+            return pid
+    return None
+
+
+def generate_project_summary(project_id, group_messages_map):
+    """Generate a single summary for a project combining all its groups."""
+    from datetime import date
+    today = date.today().isoformat()
+
+    # Combine messages from all groups for this project
+    all_msgs = []
+    group_names = []
+    for gname, msgs in group_messages_map.items():
+        group_names.append(gname)
+        for m in msgs:
+            all_msgs.append(m)
+
+    if not all_msgs:
+        return None
+
+    all_msgs.sort(key=lambda m: m["created_at"])
+
+    # Get alerts for this project
+    alerts = supabase.table("wa_alerts").select("severity, title, description, source_group").gte(
+        "created_at", today + "T00:00:00Z"
+    ).eq("source_group", None).execute().data or []  # fallback
+    # Also get alerts matching any of the group names
+    for gname in group_names:
+        g_alerts = supabase.table("wa_alerts").select("severity, title, description, source_group").gte(
+            "created_at", today + "T00:00:00Z"
+        ).eq("source_group", gname).execute().data or []
+        alerts.extend(g_alerts)
+
+    # Deduplicate alerts by title
+    seen_titles = set()
+    unique_alerts = []
+    for a in alerts:
+        if a["title"] not in seen_titles:
+            seen_titles.add(a["title"])
+            unique_alerts.append(a)
+
+    msg_text = "\n".join([
+        f"[{m['group_name'] or 'DM'}] {m['sender_name']}: {m['message'][:200]}" + (" (+ photo)" if m['num_media'] > 0 else "")
+        for m in all_msgs
+    ])
+
+    alert_text = ""
+    if unique_alerts:
+        alert_text = "\nALERTS RAISED TODAY:\n" + "\n".join([
+            f"- [{a['severity'].upper()}] {a['title']}: {a['description'][:100]}" for a in unique_alerts
+        ])
+
+    groups_str = ", ".join(group_names)
+    context = f"Project {project_id} — Groups: {groups_str}\nDate: {today}\n\n{msg_text}{alert_text}\n\nTotal: {len(all_msgs)} messages, {sum(1 for m in all_msgs if m['num_media'] > 0)} photos, {len(unique_alerts)} alerts"
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            system=DAILY_SUMMARY_PROMPT,
+            messages=[{"role": "user", "content": context}],
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"[SUMMARY] Error: {e}")
+        return None
+
+
 def send_daily_summary_to_group():
-    """Generate summaries for all active groups and send to the Floatex Daily Intelligence WhatsApp group."""
+    """Generate per-project summaries and send to the Floatex Daily Intelligence WhatsApp group."""
     from datetime import date
 
     today = date.today().isoformat()
     print(f"[SUMMARY] Generating daily summaries for {today}...")
 
-    # Get all groups with messages today
-    messages = supabase.table("whatsapp_messages").select("group_name").gte(
-        "created_at", today + "T00:00:00Z"
-    ).not_.is_("group_name", "null").execute().data or []
+    # Get all messages today with group names
+    messages = supabase.table("whatsapp_messages").select(
+        "sender_name, group_name, message, num_media, created_at"
+    ).gte("created_at", today + "T00:00:00Z").not_.is_(
+        "group_name", "null"
+    ).order("created_at").execute().data or []
 
-    groups = list(set(m["group_name"] for m in messages if m["group_name"]))
-    if not groups:
+    if not messages:
         print("[SUMMARY] No group messages today, skipping.")
         return
 
-    # Generate combined summary
+    # Group messages by project ID
+    project_groups = {}  # project_id -> {group_name -> [messages]}
+    ungrouped = {}  # group_name -> [messages] for groups without a project ID
+
+    for m in messages:
+        gname = m.get("group_name")
+        if not gname:
+            continue
+        pid = detect_project_from_group(gname)
+        if pid:
+            if pid not in project_groups:
+                project_groups[pid] = {}
+            if gname not in project_groups[pid]:
+                project_groups[pid][gname] = []
+            project_groups[pid][gname].append(m)
+        else:
+            if gname not in ungrouped:
+                ungrouped[gname] = []
+            ungrouped[gname].append(m)
+
+    # Generate per-project summaries
     all_summaries = []
-    for group in sorted(groups):
-        summary = generate_daily_summary(group_name=group)
+    for pid in sorted(project_groups.keys()):
+        group_count = len(project_groups[pid])
+        msg_count = sum(len(msgs) for msgs in project_groups[pid].values())
+        print(f"[SUMMARY] {pid}: {group_count} groups, {msg_count} messages")
+        summary = generate_project_summary(pid, project_groups[pid])
+        if summary:
+            all_summaries.append(summary)
+
+    # Handle ungrouped (groups without a detectable project ID)
+    for gname, msgs in ungrouped.items():
+        summary = generate_daily_summary(group_name=gname)
         if summary:
             all_summaries.append(summary)
 
@@ -453,7 +569,7 @@ def send_daily_summary_to_group():
         return
 
     # Build WhatsApp message
-    header = f"📊 *FLOATEX DAILY INTELLIGENCE*\n📅 {today}\n{'─' * 30}\n\n"
+    header = f"*FLOATEX DAILY INTELLIGENCE*\n{today}\n{'─' * 30}\n\n"
     full_message = header + "\n\n".join(all_summaries)
 
     # Truncate for WhatsApp (max ~4096 chars for group messages)
