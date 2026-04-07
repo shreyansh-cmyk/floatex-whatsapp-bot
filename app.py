@@ -455,22 +455,22 @@ def send_daily_summary_to_group():
     if len(full_message) > 4000:
         full_message = full_message[:3997] + "..."
 
-    # Send via Twilio to the Daily Intelligence group
-    if not DAILY_SUMMARY_GROUP:
-        print("[SUMMARY] No DAILY_SUMMARY_GROUP configured. Summary generated but not sent.")
-        print(f"[SUMMARY] Preview ({len(full_message)} chars):\n{full_message[:500]}...")
-        return
+    # Send via WA Bridge to the Daily Intelligence group
+    WA_BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "https://floatex-wa-bridge-production.up.railway.app")
 
     try:
-        twilio_client.messages.create(
-            from_=BOT_NUMBER,
-            to=DAILY_SUMMARY_GROUP,
-            body=full_message,
+        resp = httpx.post(
+            WA_BRIDGE_URL + "/send",
+            json={"group_name": "Floatex Daily Intelligence", "message": full_message},
+            timeout=30,
         )
-        print(f"[SUMMARY] Sent daily summary to group ({len(full_message)} chars, {len(groups)} groups)")
+        if resp.status_code == 200:
+            print(f"[SUMMARY] Sent daily summary to group via bridge ({len(full_message)} chars, {len(groups)} groups)")
+        else:
+            raise Exception(f"Bridge returned {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"[SUMMARY] Failed to send: {e}")
-        # If group send fails, try sending to Shreyansh directly
+        print(f"[SUMMARY] Bridge send failed: {e}")
+        # Fallback: send to Shreyansh directly via Twilio
         try:
             twilio_client.messages.create(
                 from_=BOT_NUMBER,
