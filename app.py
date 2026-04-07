@@ -389,8 +389,13 @@ def generate_daily_summary(project_id=None, group_name=None):
     if not messages:
         return None
 
-    # Get today's alerts too
-    alerts = supabase.table("wa_alerts").select("severity, title, description").gte("created_at", today + "T00:00:00Z").execute().data or []
+    # Get today's alerts — filtered by the same group
+    alert_query = supabase.table("wa_alerts").select("severity, title, description, source_group").gte("created_at", today + "T00:00:00Z")
+    if group_name:
+        alert_query = alert_query.eq("source_group", group_name)
+    elif project_id:
+        alert_query = alert_query.eq("project_id", project_id)
+    alerts = alert_query.execute().data or []
 
     # Build context
     msg_text = "\n".join([
