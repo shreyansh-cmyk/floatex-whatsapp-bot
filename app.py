@@ -31,6 +31,8 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 BOT_NAME = os.environ.get("BOT_NAME", "Floatex AI")
 BOT_NUMBER = os.environ.get("BOT_NUMBER", "")  # e.g. whatsapp:+14155238886
+DAILY_SUMMARY_GROUP = os.environ.get("DAILY_SUMMARY_GROUP", "")  # WhatsApp group JID for daily summaries
+SUMMARY_HOUR_IST = int(os.environ.get("SUMMARY_HOUR_IST", "20"))  # 8 PM IST default
 
 # In-memory conversation history (per sender, for contextual replies)
 conversations = {}
@@ -415,6 +417,98 @@ def generate_daily_summary(project_id=None, group_name=None):
     except Exception as e:
         print(f"[SUMMARY] Error: {e}")
         return None
+
+
+def send_daily_summary_to_group():
+    """Generate summaries for all active groups and send to the Floatex Daily Intelligence WhatsApp group."""
+    from datetime import date
+
+    today = date.today().isoformat()
+    print(f"[SUMMARY] Generating daily summaries for {today}...")
+
+    # Get all groups with messages today
+    messages = supabase.table("whatsapp_messages").select("group_name").gte(
+        "created_at", today + "T00:00:00Z"
+    ).not_.is_("group_name", "null").execute().data or []
+
+    groups = list(set(m["group_name"] for m in messages if m["group_name"]))
+    if not groups:
+        print("[SUMMARY] No group messages today, skipping.")
+        return
+
+    # Generate combined summary
+    all_summaries = []
+    for group in sorted(groups):
+        summary = generate_daily_summary(group_name=group)
+        if summary:
+            all_summaries.append(summary)
+
+    if not all_summaries:
+        print("[SUMMARY] No summaries generated.")
+        return
+
+    # Build WhatsApp message
+    header = f"📊 *FLOATEX DAILY INTELLIGENCE*\n📅 {today}\n{'─' * 30}\n\n"
+    full_message = header + "\n\n".join(all_summaries)
+
+    # Truncate for WhatsApp (max ~4096 chars for group messages)
+    if len(full_message) > 4000:
+        full_message = full_message[:3997] + "..."
+
+    # Send via Twilio to the Daily Intelligence group
+    if not DAILY_SUMMARY_GROUP:
+        print("[SUMMARY] No DAILY_SUMMARY_GROUP configured. Summary generated but not sent.")
+        print(f"[SUMMARY] Preview ({len(full_message)} chars):\n{full_message[:500]}...")
+        return
+
+    try:
+        twilio_client.messages.create(
+            from_=BOT_NUMBER,
+            to=DAILY_SUMMARY_GROUP,
+            body=full_message,
+        )
+        print(f"[SUMMARY] Sent daily summary to group ({len(full_message)} chars, {len(groups)} groups)")
+    except Exception as e:
+        print(f"[SUMMARY] Failed to send: {e}")
+        # If group send fails, try sending to Shreyansh directly
+        try:
+            twilio_client.messages.create(
+                from_=BOT_NUMBER,
+                to="whatsapp:+918860907679",
+                body=full_message,
+            )
+            print("[SUMMARY] Sent to Shreyansh directly as fallback")
+        except Exception as e2:
+            print(f"[SUMMARY] Fallback also failed: {e2}")
+
+
+def schedule_daily_summary():
+    """Schedule the daily summary to run at SUMMARY_HOUR_IST every day."""
+    from datetime import datetime, timedelta
+    import pytz
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    target = now_ist.replace(hour=SUMMARY_HOUR_IST, minute=0, second=0, microsecond=0)
+
+    if now_ist >= target:
+        target += timedelta(days=1)
+
+    delay = (target - now_ist).total_seconds()
+    print(f"[SUMMARY] Next daily summary scheduled at {target.strftime('%Y-%m-%d %H:%M IST')} (in {delay/3600:.1f} hours)")
+
+    def run_and_reschedule():
+        try:
+            send_daily_summary_to_group()
+        except Exception as e:
+            print(f"[SUMMARY] Error in scheduled run: {e}")
+        schedule_daily_summary()
+
+    timer = threading.Timer(delay, run_and_reschedule)
+    timer.daemon = True
+    timer.start()
+
+schedule_daily_summary()
 
 
 def fetch_image_as_base64(media_url):
@@ -1811,6 +1905,15 @@ def daily_summary_all():
             summaries[group] = summary
 
     return {"date": today, "summaries": summaries}, 200
+
+
+@app.route("/api/send-summary-now", methods=["POST", "OPTIONS"])
+def send_summary_now():
+    """Manually trigger the daily summary."""
+    if request.method == "OPTIONS":
+        return "", 204
+    send_daily_summary_to_group()
+    return {"status": "sent"}, 200
 
 
 @app.route("/", methods=["GET"])
