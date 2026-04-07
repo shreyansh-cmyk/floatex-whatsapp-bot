@@ -137,47 +137,75 @@ def save_image_to_storage(media_base64, media_type, message_id, project_id):
         return None
 
 
-DPR_PARSER_PROMPT = """You are parsing a WhatsApp message from a Floatex Solar site group for Daily Progress Report (DPR) data.
+DPR_PARSER_PROMPT = """You are parsing a WhatsApp DPR (Daily Progress Report) from a Floatex Solar site.
 
-Determine if this message contains DPR data (block casting/dropping counts, module installation counts, or mooring progress).
-If NOT a DPR message, return: {"is_dpr": false}
+If this is NOT a DPR message, return: {"is_dpr": false}
 
-If it IS a DPR message, extract structured data. Numbers often appear as today/cumulative/total triplets.
+If it IS a DPR, extract ALL data. DPRs come in varied formats but typically contain:
+- Block casting/dropping counts (today/cumulative/total triplets or cumulative/total pairs)
+- Steel reinforcement, shuttering, RFI counts
+- Material stock status
+- Manpower counts
+- Tomorrow's plan
+- Module installation progress
 
 Return JSON:
 {
   "is_dpr": true,
   "dpr_type": "block_casting|installation|mooring",
-  "reporting_date": "YYYY-MM-DD or null if not mentioned",
+  "reporting_date": "YYYY-MM-DD",
+  "project_name": "extracted project name if mentioned",
   "data": {
-    // For block_casting:
+    // BLOCK CASTING — use TODAY's count (first number in today/cumulative/total triplet)
+    // For cumulative/total pairs like "199/204", today=0 (it's a status, not daily count)
     "b_type1": 0, "b_type2": 0, "b_type3": 0, "b_type4": 0,
     "b_type5": 0, "b_type6": 0, "b_type7": 0,
     "b_ifp_type_a": 0, "b_ifp_type_b": 0, "b_cable_block": 0,
-    // Use the TODAY count (first number in today/cumulative/total)
-    // "Array Block" or generic block = b_type1
-    // "IFP Block" = b_ifp_type_a
-    // "DC Block" or "Cable Block" = b_cable_block
-    // "AC Block" = b_type2
-    // Type03, Type04 etc map to b_type3, b_type4
-    // If message just says "14 blocks" without type, put in b_type1
+    // Mapping: Type 01 = b_type1, Type 02 = b_type2, Type 03 = b_type3, Type 04 = b_type4
+    // IFP Block = b_ifp_type_a, Cable/AC/DC Block = b_cable_block
+    // "Dead Block Casting" lines have today/cumulative/total — use the today count
 
-    // For installation:
-    "array_no": "string",
+    // INSTALLATION (if applicable)
+    "array_no": "string or null",
     "modules_today": 0,
     "modules_cumulative": 0,
     "modules_total": 0,
     "labour_count": 0,
     "module_wp": "585 Wp or null",
     "supervisors": "name or null"
+  },
+  "extended": {
+    // Capture everything else from the DPR
+    "reinforcement_today": 0,
+    "reinforcement_cumulative": 0,
+    "reinforcement_total": 0,
+    "shuttering_today": 0,
+    "shuttering_cumulative": 0,
+    "shuttering_total": 0,
+    "rfi_today": 0,
+    "rfi_total": 0,
+    "casting_today": 0,
+    "casting_total": 0,
+    "manpower": 0,
+    "machines": "description or null",
+    "material_stock": [
+      {"item": "Cement", "quantity": "1187 bags"},
+      {"item": "SS bar", "quantity": "1644 Nos"}
+    ],
+    "tomorrow_plan": [
+      "Steel reinforcement- 20",
+      "Shuttering box- 40"
+    ],
+    "notes": "any notes mentioned"
   }
 }
 
 Rules:
-- Only extract if there are ACTUAL numbers. "work in progress" alone is not enough.
-- Use TODAY's count (first number in triplet). If only one number given, that's today's count.
-- Date formats: DD/MM/YYYY, DD/MM/YY, DD-MM-YYYY. Convert to YYYY-MM-DD.
-- If no date mentioned, use null (caller will use today's date).
+- TODAY's casting = look for "Dead Block Casting" lines with today/cumulative/total format. Sum up the today counts across all types.
+- For pairs like "199/204" without a today number, today = 0.
+- Date formats: DD/MM/YYYY, DD/MM/YY, DD-MM-YYYY → convert to YYYY-MM-DD.
+- If no date, use null.
+- Capture material stock, manpower, machines, tomorrow plan in extended.
 - Return ONLY valid JSON."""
 
 
@@ -234,22 +262,25 @@ def parse_dpr_from_message(text, sender_name, group_name, project_id):
         return None
 
 
-def write_dpr_to_db(dpr_data, project_id, sender_name):
-    """Write parsed DPR data to site_block_casting or site_installation table."""
+def write_dpr_to_db(dpr_data, project_id, sender_name, message_id=None):
+    """Write parsed DPR data to site_block_casting or site_installation table + extended data to wa_knowledge."""
     from datetime import date, datetime
 
     dpr_type = dpr_data.get("dpr_type", "")
     reporting_date = dpr_data.get("reporting_date")
     data = dpr_data.get("data", {})
+    extended = dpr_data.get("extended", {})
 
     # Default to today if no date
     if not reporting_date:
         reporting_date = date.today().isoformat()
 
+    pid = project_id or "UNKNOWN"
+
     try:
         if dpr_type == "block_casting":
             row = {
-                "project_id": project_id or "UNKNOWN",
+                "project_id": pid,
                 "reporting_date": reporting_date,
                 "reported_by": sender_name,
                 "b_type1": data.get("b_type1", 0) or 0,
@@ -264,19 +295,58 @@ def write_dpr_to_db(dpr_data, project_id, sender_name):
                 "b_cable_block": data.get("b_cable_block", 0) or 0,
                 "submitted_at": datetime.now().isoformat(),
             }
-            # Skip if all counts are zero
             block_total = sum(v for k, v in row.items() if k.startswith("b_") and isinstance(v, int))
-            if block_total == 0:
+
+            # Store extended DPR data as knowledge facts
+            if extended:
+                facts = []
+                casting_today = extended.get("casting_today", 0)
+                casting_total = extended.get("casting_total", 0)
+                rfi_today = extended.get("rfi_today", 0)
+                rfi_total = extended.get("rfi_total", 0)
+                manpower = extended.get("manpower", 0)
+
+                if casting_today or casting_total:
+                    facts.append(f"Block casting DPR {reporting_date}: {casting_today} today, {casting_total} total")
+                if rfi_today or rfi_total:
+                    facts.append(f"RFI: {rfi_today} today, {rfi_total} total")
+                if manpower:
+                    facts.append(f"Manpower on site: {manpower}")
+
+                # Material stock
+                for item in (extended.get("material_stock") or []):
+                    if isinstance(item, dict):
+                        facts.append(f"Stock: {item.get('item', '')} - {item.get('quantity', '')}")
+
+                # Tomorrow plan
+                plan = extended.get("tomorrow_plan") or []
+                if plan:
+                    facts.append(f"Tomorrow plan: {', '.join(plan[:5])}")
+
+                for fact in facts:
+                    try:
+                        supabase.table("wa_knowledge").insert({
+                            "message_id": message_id,
+                            "project_id": pid,
+                            "category": "progress",
+                            "fact": fact,
+                            "source_sender": sender_name,
+                            "confidence": "high",
+                        }).execute()
+                    except Exception as e:
+                        print(f"[DPR] Knowledge write error: {e}")
+
+            if block_total == 0 and not (extended.get("casting_today", 0)):
                 print(f"[DPR] Skipping zero-count block casting entry")
-                return None
+                return {"type": "block_casting", "extended_only": True}
 
             result = supabase.table("site_block_casting").insert(row).execute()
-            print(f"[DPR] Wrote block_casting: {block_total} blocks by {sender_name} on {reporting_date}")
+            print(f"[DPR] Wrote block_casting: {block_total} blocks, casting_today={extended.get('casting_today', 0)}, manpower={extended.get('manpower', 0)} — {sender_name} on {reporting_date}")
             return result.data[0] if result.data else None
 
         elif dpr_type == "installation":
             row = {
-                "project_id": project_id or "UNKNOWN",
+                "project_id": pid,
                 "reporting_date": reporting_date,
                 "reported_by": sender_name,
                 "array_no": data.get("array_no", ""),
@@ -386,6 +456,8 @@ def detect_project_id(text):
         "tilaiya": "P014", "getalsud": "P013", "gail": "P016",
         "hazira": "P017", "mejia": "P018", "indravati": "P019",
         "gridco": "P019", "ongc": "P017",
+        "dvc": "P014", "155mw": "P014", "155 mw": "P014",
+        "pata": "P016", "gail-ppl": "P016",
     }
     lower = text.lower()
     for keyword, pid in project_map.items():
@@ -1668,7 +1740,7 @@ def wa_message():
                     dpr_project = project_id
                     if not dpr_project and group_name:
                         dpr_project = detect_project_id(group_name)
-                    result = write_dpr_to_db(dpr_data, dpr_project, sender_name)
+                    result = write_dpr_to_db(dpr_data, dpr_project, sender_name, message_id=message_id)
                     if result:
                         dpr_written = True
 
