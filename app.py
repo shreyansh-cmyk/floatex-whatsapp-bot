@@ -2078,9 +2078,6 @@ def api_costs():
     week_ago = (date.today() - timedelta(days=7)).isoformat()
     month_start = date.today().replace(day=1).isoformat()
 
-    # Today's costs by type
-    today_data = supabase.rpc("", {}).execute()  # Can't use rpc easily, use raw query via select
-
     today_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", today + "T00:00:00Z").execute().data or []
     week_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", week_ago + "T00:00:00Z").execute().data or []
     month_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", month_start + "T00:00:00Z").execute().data or []
