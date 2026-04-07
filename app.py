@@ -41,6 +41,37 @@ conversations = {}
 import hashlib
 import time as _time
 
+# --- Cost tracking ---
+# Pricing per 1M tokens (as of 2026)
+MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.0},
+}
+
+def track_usage(call_type, model, response, project_id=None, source="wa_bridge", metadata=None):
+    """Log API usage and estimated cost to Supabase."""
+    try:
+        input_tokens = response.usage.input_tokens or 0
+        output_tokens = response.usage.output_tokens or 0
+        total_tokens = input_tokens + output_tokens
+
+        pricing = MODEL_PRICING.get(model, {"input": 3.0, "output": 15.0})
+        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
+
+        supabase.table("api_usage").insert({
+            "call_type": call_type,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": round(cost, 6),
+            "project_id": project_id,
+            "source": source,
+            "metadata": metadata or {},
+        }).execute()
+    except Exception as e:
+        print(f"[COST] Tracking error: {e}")
+
 # Track recent image hashes to skip duplicates (same image sent multiple times)
 _recent_image_hashes = {}  # hash -> timestamp
 _IMAGE_DEDUP_WINDOW = 300  # 5 minutes — skip if same image seen within this window
@@ -243,12 +274,14 @@ def parse_dpr_from_message(text, sender_name, group_name, project_id):
         return None
 
     try:
+        model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=512,
             system=DPR_PARSER_PROMPT,
             messages=[{"role": "user", "content": f"Group: {group_name}\nSender: {sender_name}\nMessage: {text}"}],
         )
+        track_usage("dpr_parse", model, response, project_id=project_id, source="wa_bridge", metadata={"group": group_name})
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
@@ -412,12 +445,14 @@ def generate_daily_summary(project_id=None, group_name=None):
     context = f"Messages from {group_name or project_id or 'all groups'} on {today}:\n\n{msg_text}{alert_text}\n\nTotal: {len(messages)} messages, {sum(1 for m in messages if m['num_media'] > 0)} photos, {len(alerts)} alerts"
 
     try:
+        model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=800,
             system=DAILY_SUMMARY_PROMPT,
             messages=[{"role": "user", "content": context}],
         )
+        track_usage("daily_summary", model, response, project_id=project_id, source="system", metadata={"group": group_name})
         return response.content[0].text
     except Exception as e:
         print(f"[SUMMARY] Error: {e}")
@@ -498,12 +533,14 @@ def generate_project_summary(project_id, group_messages_map):
     context = f"Project {project_id} — Groups: {groups_str}\nDate: {today}\n\n{msg_text}{alert_text}\n\nTotal: {len(all_msgs)} messages, {sum(1 for m in all_msgs if m['num_media'] > 0)} photos, {len(unique_alerts)} alerts"
 
     try:
+        model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=800,
             system=DAILY_SUMMARY_PROMPT,
             messages=[{"role": "user", "content": context}],
         )
+        track_usage("daily_summary", model, response, project_id=project_id, source="system", metadata={"groups": group_names})
         return response.content[0].text
     except Exception as e:
         print(f"[SUMMARY] Error: {e}")
@@ -706,11 +743,12 @@ def store_message(sender, sender_name, group_id, group_name, body, num_media, me
         return None
 
 
-def analyze_image_vision(b64_data, media_type, caption="", system_prompt=None):
+def analyze_image_vision(b64_data, media_type, caption="", system_prompt=None, project_id=None, source="wa_bridge"):
     """Send image to Claude Vision and return analysis text."""
     prompt = caption or "Analyze this site photo. Focus on: progress, safety issues, material condition. Be concise — bullet points, under 200 words."
+    model = "claude-sonnet-4-20250514"
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=model,
         max_tokens=600,
         system=system_prompt or SYSTEM_PROMPT,
         messages=[{
@@ -721,6 +759,7 @@ def analyze_image_vision(b64_data, media_type, caption="", system_prompt=None):
             ],
         }],
     )
+    track_usage("vision_analysis", model, response, project_id=project_id, source=source)
     return response.content[0].text
 
 
@@ -772,12 +811,14 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
         extraction_system = EXTRACTION_PROMPT + "\n\n" + memory
 
     try:
+        model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=512,
             system=extraction_system,
             messages=[{"role": "user", "content": context}],
         )
+        track_usage("knowledge_extraction", model, response, project_id=project_id, source="wa_bridge", metadata={"group": group_name})
         raw = response.content[0].text.strip()
         # Clean markdown code fences if present
         if raw.startswith("```"):
@@ -2026,6 +2067,53 @@ def daily_summary_all():
             summaries[group] = summary
 
     return {"date": today, "summaries": summaries}, 200
+
+
+@app.route("/api/costs", methods=["GET"])
+def api_costs():
+    """Get API usage costs — today, this week, this month, by type."""
+    from datetime import date, timedelta
+
+    today = date.today().isoformat()
+    week_ago = (date.today() - timedelta(days=7)).isoformat()
+    month_start = date.today().replace(day=1).isoformat()
+
+    # Today's costs by type
+    today_data = supabase.rpc("", {}).execute()  # Can't use rpc easily, use raw query via select
+
+    today_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", today + "T00:00:00Z").execute().data or []
+    week_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", week_ago + "T00:00:00Z").execute().data or []
+    month_rows = supabase.table("api_usage").select("call_type, estimated_cost_usd, total_tokens").gte("created_at", month_start + "T00:00:00Z").execute().data or []
+
+    def summarize(rows):
+        by_type = {}
+        total_cost = 0
+        total_tokens = 0
+        total_calls = len(rows)
+        for r in rows:
+            ct = r["call_type"]
+            cost = float(r["estimated_cost_usd"] or 0)
+            tokens = r["total_tokens"] or 0
+            total_cost += cost
+            total_tokens += tokens
+            if ct not in by_type:
+                by_type[ct] = {"calls": 0, "cost_usd": 0, "tokens": 0}
+            by_type[ct]["calls"] += 1
+            by_type[ct]["cost_usd"] = round(by_type[ct]["cost_usd"] + cost, 6)
+            by_type[ct]["tokens"] += tokens
+        return {
+            "total_calls": total_calls,
+            "total_cost_usd": round(total_cost, 4),
+            "total_cost_inr": round(total_cost * 85, 2),
+            "total_tokens": total_tokens,
+            "by_type": by_type,
+        }
+
+    return {
+        "today": summarize(today_rows),
+        "last_7_days": summarize(week_rows),
+        "this_month": summarize(month_rows),
+    }, 200
 
 
 @app.route("/api/send-summary-now", methods=["POST", "OPTIONS"])
