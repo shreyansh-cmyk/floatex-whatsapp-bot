@@ -137,6 +137,216 @@ def save_image_to_storage(media_base64, media_type, message_id, project_id):
         return None
 
 
+DPR_PARSER_PROMPT = """You are parsing a WhatsApp message from a Floatex Solar site group for Daily Progress Report (DPR) data.
+
+Determine if this message contains DPR data (block casting/dropping counts, module installation counts, or mooring progress).
+If NOT a DPR message, return: {"is_dpr": false}
+
+If it IS a DPR message, extract structured data. Numbers often appear as today/cumulative/total triplets.
+
+Return JSON:
+{
+  "is_dpr": true,
+  "dpr_type": "block_casting|installation|mooring",
+  "reporting_date": "YYYY-MM-DD or null if not mentioned",
+  "data": {
+    // For block_casting:
+    "b_type1": 0, "b_type2": 0, "b_type3": 0, "b_type4": 0,
+    "b_type5": 0, "b_type6": 0, "b_type7": 0,
+    "b_ifp_type_a": 0, "b_ifp_type_b": 0, "b_cable_block": 0,
+    // Use the TODAY count (first number in today/cumulative/total)
+    // "Array Block" or generic block = b_type1
+    // "IFP Block" = b_ifp_type_a
+    // "DC Block" or "Cable Block" = b_cable_block
+    // "AC Block" = b_type2
+    // Type03, Type04 etc map to b_type3, b_type4
+    // If message just says "14 blocks" without type, put in b_type1
+
+    // For installation:
+    "array_no": "string",
+    "modules_today": 0,
+    "modules_cumulative": 0,
+    "modules_total": 0,
+    "labour_count": 0,
+    "module_wp": "585 Wp or null",
+    "supervisors": "name or null"
+  }
+}
+
+Rules:
+- Only extract if there are ACTUAL numbers. "work in progress" alone is not enough.
+- Use TODAY's count (first number in triplet). If only one number given, that's today's count.
+- Date formats: DD/MM/YYYY, DD/MM/YY, DD-MM-YYYY. Convert to YYYY-MM-DD.
+- If no date mentioned, use null (caller will use today's date).
+- Return ONLY valid JSON."""
+
+
+DAILY_SUMMARY_PROMPT = """Generate a concise daily project summary from these WhatsApp messages.
+
+Format:
+## {Project/Group Name} — {Date}
+
+**Progress:**
+- Key numbers and milestones achieved today
+
+**Issues & Alerts:**
+- Safety observations, equipment breakdowns, delays
+
+**Action Items:**
+- Pending follow-ups, unresolved issues
+
+**Stats:** {X} messages, {Y} photos, {Z} alerts
+
+Keep it under 300 words. Use bullet points. Be factual — don't add interpretations beyond what the messages say."""
+
+
+def parse_dpr_from_message(text, sender_name, group_name, project_id):
+    """Try to parse DPR data from a WhatsApp message. Returns parsed data or None."""
+    if not text or len(text) < 10:
+        return None
+
+    # Quick check — does it look like a DPR?
+    dpr_keywords = ["block", "dropping", "cast", "module", "install", "dpr", "progress report",
+                     "type0", "type1", "type2", "array", "mooring", "total"]
+    text_lower = text.lower()
+    if not any(k in text_lower for k in dpr_keywords):
+        return None
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            system=DPR_PARSER_PROMPT,
+            messages=[{"role": "user", "content": f"Group: {group_name}\nSender: {sender_name}\nMessage: {text}"}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r'^```(?:json)?\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+        data = json.loads(raw)
+
+        if not data.get("is_dpr"):
+            return None
+
+        return data
+    except Exception as e:
+        print(f"[DPR] Parse error: {e}")
+        return None
+
+
+def write_dpr_to_db(dpr_data, project_id, sender_name):
+    """Write parsed DPR data to site_block_casting or site_installation table."""
+    from datetime import date, datetime
+
+    dpr_type = dpr_data.get("dpr_type", "")
+    reporting_date = dpr_data.get("reporting_date")
+    data = dpr_data.get("data", {})
+
+    # Default to today if no date
+    if not reporting_date:
+        reporting_date = date.today().isoformat()
+
+    try:
+        if dpr_type == "block_casting":
+            row = {
+                "project_id": project_id or "UNKNOWN",
+                "reporting_date": reporting_date,
+                "reported_by": sender_name,
+                "b_type1": data.get("b_type1", 0) or 0,
+                "b_type2": data.get("b_type2", 0) or 0,
+                "b_type3": data.get("b_type3", 0) or 0,
+                "b_type4": data.get("b_type4", 0) or 0,
+                "b_type5": data.get("b_type5", 0) or 0,
+                "b_type6": data.get("b_type6", 0) or 0,
+                "b_type7": data.get("b_type7", 0) or 0,
+                "b_ifp_type_a": data.get("b_ifp_type_a", 0) or 0,
+                "b_ifp_type_b": data.get("b_ifp_type_b", 0) or 0,
+                "b_cable_block": data.get("b_cable_block", 0) or 0,
+                "submitted_at": datetime.now().isoformat(),
+            }
+            # Skip if all counts are zero
+            block_total = sum(v for k, v in row.items() if k.startswith("b_") and isinstance(v, int))
+            if block_total == 0:
+                print(f"[DPR] Skipping zero-count block casting entry")
+                return None
+
+            result = supabase.table("site_block_casting").insert(row).execute()
+            print(f"[DPR] Wrote block_casting: {block_total} blocks by {sender_name} on {reporting_date}")
+            return result.data[0] if result.data else None
+
+        elif dpr_type == "installation":
+            row = {
+                "project_id": project_id or "UNKNOWN",
+                "reporting_date": reporting_date,
+                "reported_by": sender_name,
+                "array_no": data.get("array_no", ""),
+                "modules_today": data.get("modules_today", 0) or 0,
+                "modules_cumulative": data.get("modules_cumulative", 0) or 0,
+                "modules_total": data.get("modules_total", 0) or 0,
+                "labour_count": data.get("labour_count", 0) or 0,
+                "module_wp": data.get("module_wp"),
+                "supervisors": data.get("supervisors"),
+                "submitted_at": datetime.now().isoformat(),
+            }
+            if row["modules_today"] == 0:
+                print(f"[DPR] Skipping zero-count installation entry")
+                return None
+
+            result = supabase.table("site_installation").insert(row).execute()
+            print(f"[DPR] Wrote installation: {row['modules_today']} modules by {sender_name} on {reporting_date}")
+            return result.data[0] if result.data else None
+
+    except Exception as e:
+        print(f"[DPR] DB write error: {e}")
+        return None
+
+
+def generate_daily_summary(project_id=None, group_name=None):
+    """Generate daily summary from today's WhatsApp messages."""
+    from datetime import date
+
+    today = date.today().isoformat()
+    query = supabase.table("whatsapp_messages").select("sender_name, group_name, message, num_media, created_at").gte("created_at", today + "T00:00:00Z")
+
+    if project_id:
+        query = query.eq("project_tag", project_id)
+    elif group_name:
+        query = query.eq("group_name", group_name)
+
+    messages = query.order("created_at").execute().data or []
+    if not messages:
+        return None
+
+    # Get today's alerts too
+    alerts = supabase.table("wa_alerts").select("severity, title, description").gte("created_at", today + "T00:00:00Z").execute().data or []
+
+    # Build context
+    msg_text = "\n".join([
+        f"[{m['created_at'][:16]}] {m['sender_name']}: {m['message'][:200]}" + (" (+ photo)" if m['num_media'] > 0 else "")
+        for m in messages
+    ])
+
+    alert_text = ""
+    if alerts:
+        alert_text = "\nALERTS RAISED TODAY:\n" + "\n".join([
+            f"- [{a['severity'].upper()}] {a['title']}: {a['description'][:100]}" for a in alerts
+        ])
+
+    context = f"Messages from {group_name or project_id or 'all groups'} on {today}:\n\n{msg_text}{alert_text}\n\nTotal: {len(messages)} messages, {sum(1 for m in messages if m['num_media'] > 0)} photos, {len(alerts)} alerts"
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            system=DAILY_SUMMARY_PROMPT,
+            messages=[{"role": "user", "content": context}],
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"[SUMMARY] Error: {e}")
+        return None
+
+
 def fetch_image_as_base64(media_url):
     """Fetch an image from Twilio and return (base64_data, media_type)."""
     response = httpx.get(
@@ -1447,20 +1657,38 @@ def wa_message():
 
         else:
             # Text-only: process immediately (cheap — just Haiku)
+            dpr_written = False
             if message_id and text:
                 memory = build_memory_context(project_id)
+
+                # Try DPR parsing first
+                dpr_data = parse_dpr_from_message(text, sender_name, group_name, project_id)
+                if dpr_data:
+                    # Auto-detect project from group name if not in text
+                    dpr_project = project_id
+                    if not dpr_project and group_name:
+                        dpr_project = detect_project_id(group_name)
+                    result = write_dpr_to_db(dpr_data, dpr_project, sender_name)
+                    if result:
+                        dpr_written = True
+
+                # Still extract knowledge (catches non-DPR info in the same message)
                 extract_and_store_knowledge(
                     message_id, text, [], project_id, sender_name, group_name,
                     memory=memory,
                 )
 
             if message_id:
-                supabase.table("whatsapp_messages").update({"processed": True}).eq("id", message_id).execute()
+                supabase.table("whatsapp_messages").update({
+                    "processed": True,
+                    "is_dpr": dpr_written,
+                }).eq("id", message_id).execute()
 
             return {
                 "status": "ok",
                 "message_id": message_id,
                 "project_id": project_id,
+                "dpr_written": dpr_written,
                 "images_analyzed": 0,
             }, 200
 
@@ -1469,9 +1697,53 @@ def wa_message():
         return {"error": str(e)}, 500
 
 
+@app.route("/api/daily-summary", methods=["POST", "OPTIONS"])
+def daily_summary():
+    """Generate daily summary for a project or group."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    project_id = data.get("project_id")
+    group_name = data.get("group_name")
+
+    summary = generate_daily_summary(project_id=project_id, group_name=group_name)
+    if not summary:
+        return {"error": "No messages found for today"}, 404
+
+    return {"summary": summary}, 200
+
+
+@app.route("/api/daily-summary-all", methods=["POST", "OPTIONS"])
+def daily_summary_all():
+    """Generate daily summaries for all active groups."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    from datetime import date
+    today = date.today().isoformat()
+
+    # Get all groups with messages today
+    messages = supabase.table("whatsapp_messages").select("group_name").gte(
+        "created_at", today + "T00:00:00Z"
+    ).not_.is_("group_name", "null").execute().data or []
+
+    groups = list(set(m["group_name"] for m in messages if m["group_name"]))
+    if not groups:
+        return {"error": "No group messages today"}, 404
+
+    summaries = {}
+    for group in groups:
+        summary = generate_daily_summary(group_name=group)
+        if summary:
+            summaries[group] = summary
+
+    return {"date": today, "summaries": summaries}, 200
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return "Floatex Intelligence Platform — Bot + Docs + Skills", 200
+    return "Floatex Intelligence Platform — Bot + Docs + Skills + DPR + Summaries", 200
 
 
 if __name__ == "__main__":
