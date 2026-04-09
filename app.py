@@ -277,7 +277,7 @@ def parse_dpr_from_message(text, sender_name, group_name, project_id):
         model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
             model=model,
-            max_tokens=512,
+            max_tokens=1024,
             system=DPR_PARSER_PROMPT,
             messages=[{"role": "user", "content": f"Group: {group_name}\nSender: {sender_name}\nMessage: {text}"}],
         )
@@ -814,7 +814,7 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
         model = "claude-haiku-4-5-20251001"
         response = claude.messages.create(
             model=model,
-            max_tokens=512,
+            max_tokens=1024,
             system=extraction_system,
             messages=[{"role": "user", "content": context}],
         )
@@ -833,12 +833,23 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
     extracted_project = project_id  # Only use the one we detected from message text (matches projects table)
     alerts = []
 
+    # Validate project_id exists before inserting (avoid FK errors)
+    valid_project_id = extracted_project
+    if valid_project_id:
+        try:
+            check = supabase.table("projects").select("id").eq("id", valid_project_id).maybe_single().execute()
+            if not check.data:
+                print(f"[KNOWLEDGE] Project {valid_project_id} not in DB, storing without project link")
+                valid_project_id = None
+        except:
+            valid_project_id = None
+
     # Store knowledge
     for item in data.get("knowledge", []):
         try:
             supabase.table("wa_knowledge").insert({
                 "message_id": message_id,
-                "project_id": extracted_project,
+                "project_id": valid_project_id,
                 "category": item["category"],
                 "fact": item["fact"],
                 "source_sender": sender,
@@ -853,7 +864,7 @@ def extract_and_store_knowledge(message_id, body, image_analyses, project_id, se
         try:
             result = supabase.table("wa_alerts").insert({
                 "message_id": message_id,
-                "project_id": extracted_project,
+                "project_id": valid_project_id,
                 "severity": alert["severity"],
                 "category": alert["category"],
                 "title": alert["title"],
