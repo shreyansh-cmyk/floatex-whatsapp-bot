@@ -2133,6 +2133,36 @@ def send_summary_now():
     return {"status": "sent"}, 200
 
 
+@app.route("/api/reset-password", methods=["POST", "OPTIONS"])
+def reset_password():
+    """Reset a user's password using service role key."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    new_password = data.get("new_password")
+    if not user_id or not new_password:
+        return {"error": "user_id and new_password required"}, 400
+    if len(new_password) < 6:
+        return {"error": "Password must be at least 6 characters"}, 400
+    try:
+        resp = httpx.put(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"password": new_password},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {"error": f"Supabase error: {resp.text}"}, resp.status_code
+        return {"status": "ok"}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 @app.route("/", methods=["GET"])
 def health():
     return "Floatex Intelligence Platform — Bot + Docs + Skills + DPR + Summaries", 200
